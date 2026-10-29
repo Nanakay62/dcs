@@ -1047,6 +1047,304 @@ def compute_group_comparison(df, group_col, metric_col):
     }
 
 
+# ---------------------------------------------------------------------------
+# Advanced Statistical Engines: SEM/CFA, Multi-Level HLM, RM-ANOVA, Logistic, Cox
+# ---------------------------------------------------------------------------
+
+def compute_sem_cfa(df, model_desc):
+    try:
+        import semopy
+        # Find all variable names in model_desc
+        import re
+        tokens = re.findall(r'[a-zA-Z0-9_]+', model_desc)
+        vars_needed = [t for t in tokens if t in df.columns]
+        if not vars_needed:
+            return {"error": "No matching variables found in the model syntax."}
+        
+        clean = df[vars_needed].apply(pd.to_numeric, errors='coerce').dropna()
+        if len(clean) < 5:
+            return {"error": f"Insufficient complete cases ({len(clean)} found). At least 5 complete cases required."}
+
+        model = semopy.Model(model_desc)
+        model.fit(clean)
+        
+        # Estimates
+        estimates = model.inspect()
+        estimates = estimates.rename(columns={
+            "lval": "Outcome / Indicator",
+            "op": "Path",
+            "rval": "Predictor / Factor",
+            "Estimate": "Estimate (B)",
+            "Std. Err": "Std. Error",
+            "z-value": "z-statistic",
+            "p-value": "p-value",
+        })
+        
+        # Fit stats
+        try:
+            stats_raw = semopy.calc_stats(model)
+            # stats_raw is a DataFrame where columns are metrics
+            fit_dict = {}
+            for col in stats_raw.columns:
+                val = stats_raw[col].iloc[0]
+                if pd.notna(val):
+                    fit_dict[col] = round(float(val), 4)
+        except Exception:
+            fit_dict = {}
+            
+        return {
+            "estimates": estimates,
+            "fit_stats": fit_dict,
+            "n_obs": len(clean),
+            "is_success": True
+        }
+    except Exception as e:
+        return {"error": f"SEM/CFA estimation failed: {str(e)}"}
+
+# --- Function 2: Multi-Level HLM ---
+def compute_multilevel_hlm(df, y_col, fixed_cols, group_col, random_slopes=None):
+    try:
+        import statsmodels.api as sm
+        from statsmodels.regression.mixed_linear_model import MixedLM
+        
+        cols = [y_col] + list(fixed_cols) + [group_col]
+        clean = df[cols].copy()
+        for c in [y_col] + list(fixed_cols):
+            clean[c] = pd.to_numeric(clean[c], errors='coerce')
+        clean[group_col] = clean[group_col].astype(str).str.strip()
+        clean = clean.dropna()
+        
+        if len(clean) < 10:
+            return {"error": f"Insufficient complete rows ({len(clean)}) for mixed modeling."}
+        if clean[group_col].nunique() < 2:
+            return {"error": f"Grouping variable '{group_col}' has only {clean[group_col].nunique()} cluster. At least 2 groups required."}
+
+        formula = f"{y_col} ~ " + " + ".join(fixed_cols)
+        
+        re_formula = None
+        if random_slopes:
+            valid_slopes = [s for s in random_slopes if s in fixed_cols]
+            if valid_slopes:
+                re_formula = " + ".join(valid_slopes)
+                
+        model = MixedLM.from_formula(formula, clean, groups=clean[group_col], re_formula=re_formula)
+        fit = model.fit(reml=True, method=["lbfgs"])
+        
+        # Fixed effects table
+        fe_params = fit.fe_params
+        bse = fit.bse_fe
+        tvalues = fit.tvalues
+        pvalues = fit.pvalues
+        conf_int = fit.conf_int()
+        
+        rows = []
+        for term in fe_params.index:
+            rows.append({
+                "Parameter": term,
+                "Estimate (B)": round(float(fe_params[term]), 4),
+                "Std. Error": round(float(bse.get(term, np.nan)), 4),
+                "z-value": round(float(tvalues.get(term, np.nan)), 3),
+                "p-value": round(float(pvalues.get(term, np.nan)), 4),
+                "95% CI Lower": round(float(conf_int.loc[term, 0]), 4) if term in conf_int.index else np.nan,
+                "95% CI Upper": round(float(conf_int.loc[term, 1]), 4) if term in conf_int.index else np.nan,
+            })
+        fe_df = pd.DataFrame(rows)
+        
+        # Variance components and ICC
+        group_var = float(fit.cov_re.iloc[0, 0]) if hasattr(fit, 'cov_re') and fit.cov_re.shape[0] > 0 else 0.0
+        resid_var = float(fit.scale)
+        total_var = group_var + resid_var
+        icc = round(group_var / total_var, 4) if total_var > 0 else 0.0
+        
+        re_df = pd.DataFrame([
+            {"Component": f"Between-Group Variance ({group_col})", "Variance": round(group_var, 4), "Std. Dev": round(np.sqrt(max(0, group_var)), 4)},
+            {"Component": "Residual (Within-Group) Variance", "Variance": round(resid_var, 4), "Std. Dev": round(np.sqrt(max(0, resid_var)), 4)},
+            {"Component": "Total Variance", "Variance": round(total_var, 4), "Std. Dev": round(np.sqrt(max(0, total_var)), 4)},
+        ])
+        
+        return {
+            "fixed_effects": fe_df,
+            "random_effects": re_df,
+            "icc": icc,
+            "n_obs": int(fit.nobs),
+            "n_groups": int(clean[group_col].nunique()),
+            "aic": round(float(fit.aic), 2) if hasattr(fit, 'aic') and pd.notna(fit.aic) else "-",
+            "bic": round(float(fit.bic), 2) if hasattr(fit, 'bic') and pd.notna(fit.bic) else "-",
+            "converged": fit.converged,
+            "is_success": True
+        }
+    except Exception as e:
+        return {"error": f"Multi-level model estimation failed: {str(e)}"}
+
+# --- Function 3: Repeated Measures ANOVA ---
+def compute_repeated_measures_anova(df, time_cols, between_col=None):
+    try:
+        import pingouin as pg
+        clean_cols = list(time_cols) + ([between_col] if between_col else [])
+        clean = df[clean_cols].copy()
+        for c in time_cols:
+            clean[c] = pd.to_numeric(clean[c], errors='coerce')
+        if between_col:
+            clean[between_col] = clean[between_col].astype(str)
+        clean = clean.dropna().reset_index(drop=True)
+        
+        if len(clean) < 3:
+            return {"error": "Insufficient complete cases for repeated measures ANOVA."}
+            
+        clean["subject_id"] = [f"S_{i+1}" for i in range(len(clean))]
+        long_df = clean.melt(
+            id_vars=["subject_id"] + ([between_col] if between_col else []),
+            value_vars=time_cols,
+            var_name="Measurement_Time",
+            value_name="Value"
+        )
+        
+        if between_col:
+            aov = pg.mixed_anova(data=long_df, dv="Value", within="Measurement_Time", between=between_col, subject="subject_id")
+        else:
+            aov = pg.rm_anova(data=long_df, dv="Value", within="Measurement_Time", subject="subject_id", detailed=True)
+            
+        # Sphericity test
+        try:
+            spher = pg.sphericity(data=long_df, dv="Value", within="Measurement_Time", subject="subject_id")
+            spher_res = {
+                "sphericity_w": round(float(spher[0]), 4),
+                "chi2": round(float(spher[1]), 4),
+                "df": int(spher[2]),
+                "p_value": round(float(spher[3]), 4),
+                "sphericity_met": bool(spher[4])
+            }
+        except Exception:
+            spher_res = None
+            
+        # Post-hoc pairwise tests
+        try:
+            posthoc = pg.pairwise_tests(data=long_df, dv="Value", within="Measurement_Time", subject="subject_id", padjust="bonf")
+        except Exception:
+            posthoc = None
+            
+        return {
+            "aov_table": aov,
+            "sphericity": spher_res,
+            "posthoc": posthoc,
+            "n_subjects": len(clean),
+            "is_success": True
+        }
+    except Exception as e:
+        return {"error": f"Repeated measures ANOVA failed: {str(e)}"}
+
+# --- Function 4: Logistic Regression ---
+def compute_logistic_regression(df, y_col, x_cols):
+    try:
+        import statsmodels.api as sm
+        from statsmodels.discrete.discrete_model import Logit
+        
+        cols = [y_col] + list(x_cols)
+        clean = df[cols].apply(pd.to_numeric, errors='coerce').dropna()
+        if len(clean) < 10:
+            return {"error": "Insufficient complete cases for logistic regression."}
+            
+        y = clean[y_col]
+        if y.nunique() != 2:
+            return {"error": f"Dependent variable '{y_col}' must be strictly binary (2 unique values). Found {y.nunique()} values: {list(y.unique())}."}
+            
+        # Ensure 0/1 coding
+        min_y = y.min()
+        y_binary = (y > min_y).astype(int)
+        
+        X = sm.add_constant(clean[x_cols])
+        logit_model = Logit(y_binary, X)
+        fit = logit_model.fit(disp=False, maxiter=100)
+        
+        params = fit.params
+        bse = fit.bse
+        zvalues = fit.tvalues
+        pvalues = fit.pvalues
+        conf_int = fit.conf_int()
+        
+        rows = []
+        for term in params.index:
+            coef = float(params[term])
+            se = float(bse.get(term, np.nan))
+            z = float(zvalues.get(term, np.nan))
+            p = float(pvalues.get(term, np.nan))
+            ci_low = float(conf_int.loc[term, 0]) if term in conf_int.index else np.nan
+            ci_high = float(conf_int.loc[term, 1]) if term in conf_int.index else np.nan
+            
+            odds_ratio = np.exp(coef) if np.abs(coef) < 700 else np.nan
+            or_low = np.exp(ci_low) if np.abs(ci_low) < 700 else np.nan
+            or_high = np.exp(ci_high) if np.abs(ci_high) < 700 else np.nan
+            
+            rows.append({
+                "Variable": term,
+                "Coefficient (B)": round(coef, 4),
+                "Std. Error": round(se, 4),
+                "Wald z": round(z, 3),
+                "p-value": round(p, 4),
+                "Odds Ratio (e^B)": round(odds_ratio, 4) if pd.notna(odds_ratio) else "-",
+                "95% CI Lower (OR)": round(or_low, 4) if pd.notna(or_low) else "-",
+                "95% CI Upper (OR)": round(or_high, 4) if pd.notna(or_high) else "-",
+            })
+            
+        res_df = pd.DataFrame(rows)
+        
+        # Classification accuracy
+        y_pred = (fit.predict(X) >= 0.5).astype(int)
+        accuracy = round(100.0 * (y_pred == y_binary).mean(), 1)
+        
+        return {
+            "table": res_df,
+            "pseudo_r2": round(float(fit.prsquared), 4) if hasattr(fit, 'prsquared') else "-",
+            "log_likelihood": round(float(fit.llf), 2),
+            "lr_pvalue": round(float(fit.llr_pvalue), 4) if hasattr(fit, 'llr_pvalue') else "-",
+            "accuracy": accuracy,
+            "n_obs": int(fit.nobs),
+            "is_success": True
+        }
+    except Exception as e:
+        return {"error": f"Logistic regression failed: {str(e)}"}
+
+# --- Function 5: Cox Proportional Hazards ---
+def compute_cox_survival(df, duration_col, event_col, covariates):
+    try:
+        from lifelines import CoxPHFitter
+        cols = [duration_col, event_col] + list(covariates)
+        clean = df[cols].apply(pd.to_numeric, errors='coerce').dropna()
+        if len(clean) < 10:
+            return {"error": "Insufficient complete cases for Cox survival analysis."}
+            
+        # Ensure event is binary (0/1)
+        min_ev = clean[event_col].min()
+        clean[event_col] = (clean[event_col] > min_ev).astype(int)
+        
+        cph = CoxPHFitter()
+        cph.fit(clean, duration_col=duration_col, event_col=event_col)
+        
+        summary = cph.summary.reset_index().rename(columns={"covariate": "Covariate"})
+        summary_formatted = pd.DataFrame({
+            "Covariate": summary["Covariate"],
+            "Coefficient (B)": summary["coef"].round(4),
+            "Hazard Ratio (e^B)": summary["exp(coef)"].round(4),
+            "Std. Error": summary["se(coef)"].round(4),
+            "z-value": summary["z"].round(3),
+            "p-value": summary["p"].round(4),
+            "95% CI Lower (HR)": summary["exp(coef) lower 95%"].round(4),
+            "95% CI Upper (HR)": summary["exp(coef) upper 95%"].round(4),
+        })
+        
+        return {
+            "table": summary_formatted,
+            "concordance_index": round(float(cph.concordance_index_), 4),
+            "aic": round(float(cph.AIC_partial_), 2),
+            "log_likelihood": round(float(cph.log_likelihood_), 2),
+            "n_obs": int(len(clean)),
+            "n_events": int(clean[event_col].sum()),
+            "is_success": True
+        }
+    except Exception as e:
+        return {"error": f"Cox proportional hazards estimation failed: {str(e)}"}
+
+
 def replicate_thesis_table_3(df_thesis):
     """
     Replicates Andersson & Malm (2025) Table 3 Convergent Validity Correlation Analyses (N = 122).

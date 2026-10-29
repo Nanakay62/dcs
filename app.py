@@ -1053,14 +1053,31 @@ elif app_mode.startswith("🔍"):
             st.info("Numeric items required for reliability analysis.")
 
     with gt4:
-        st.subheader("🔬 Statistical Data Analysis")
-        st.write("Live bivariate correlations, multiple linear regression, and principal component factor analysis:")
+        st.subheader("🔬 Statistical Data Analysis Studio")
+        st.write("Perform live econometric, psychometric, and advanced statistical modeling on your cleaned dataset:")
 
         num_cols_analysis = engine.get_numeric_columns(df_cleaned)
-        if len(num_cols_analysis) >= 2:
-            stat_submode = st.radio("Choose Analysis Tool:", ["Correlation Matrix", "Multiple Linear Regression", "Principal Component Loadings"], horizontal=True)
+        all_cols_analysis = list(df_cleaned.columns)
 
+        if len(num_cols_analysis) >= 2:
+            stat_submode = st.selectbox(
+                "Choose Statistical Analysis Tool:",
+                [
+                    "Correlation Matrix",
+                    "Multiple Linear Regression",
+                    "Principal Component Loadings (PCA)",
+                    "Confirmatory Factor Analysis (CFA / SEM)",
+                    "Multi-Level Hierarchical Linear Modeling (HLM)",
+                    "Repeated-Measures ANOVA",
+                    "Binary Logistic Regression",
+                    "Cox Proportional Hazards (Survival)",
+                ],
+                index=0
+            )
+
+            # Tool 1: Correlation Matrix
             if stat_submode == "Correlation Matrix":
+                st.markdown("##### 📈 Bivariate Correlation Matrix")
                 chosen_c = st.multiselect("Select Columns for Correlation Matrix:", options=num_cols_analysis, default=num_cols_analysis[:min(8, len(num_cols_analysis))])
                 method_c = st.radio("Method:", ["pearson", "spearman"], horizontal=True)
                 if len(chosen_c) >= 2:
@@ -1071,7 +1088,9 @@ elif app_mode.startswith("🔍"):
                     with st.expander("📊 View Pairwise Valid Sample Sizes (Valid Responses out of Total N)"):
                         st.dataframe(c_matrix["n_matrix"], use_container_width=True)
 
+            # Tool 2: Multiple Linear Regression
             elif stat_submode == "Multiple Linear Regression":
+                st.markdown("##### 📐 Ordinary Least Squares (OLS) Multiple Regression")
                 reg_y_m2 = st.selectbox("Select Dependent Variable (Y):", options=num_cols_analysis, index=0)
                 pred_options = [c for c in num_cols_analysis if c != reg_y_m2]
                 reg_x_m2 = st.multiselect("Select Independent Predictors (X):", options=pred_options, default=pred_options[:min(3, len(pred_options))])
@@ -1084,10 +1103,14 @@ elif app_mode.startswith("🔍"):
                         with mc2: st.metric("Adjusted R²", f"{m2_reg['adj_r_squared']:.4f}")
                         with mc3: st.metric("Model F-statistic", f"{m2_reg['f_stat']:.2f}")
                         st.dataframe(m2_reg["table"], hide_index=True, use_container_width=True)
+                    else:
+                        st.warning("⚠️ Insufficient valid observations to fit regression model.")
 
-            elif stat_submode == "Principal Component Loadings":
+            # Tool 3: Principal Component Loadings
+            elif stat_submode == "Principal Component Loadings (PCA)":
+                st.markdown("##### 🧩 Principal Component Factor Extraction")
                 pca_items = st.multiselect("Select Survey Items for Factor Extraction:", options=num_cols_analysis, default=num_cols_analysis[:min(10, len(num_cols_analysis))])
-                n_factors_m2 = st.slider("Factors to Extract:", min_value=1, max_value=5, value=2)
+                n_factors_m2 = st.slider("Factors to Extract:", min_value=1, max_value=min(10, len(pca_items)) if len(pca_items) > 1 else 2, value=2)
                 if len(pca_items) >= 2:
                     pca_res = engine.compute_pca_factor_analysis(df_cleaned, pca_items, n_factors=n_factors_m2)
                     if pca_res:
@@ -1102,6 +1125,193 @@ elif app_mode.startswith("🔍"):
                             st.dataframe(pca_res["scree"], hide_index=True, use_container_width=True)
                     else:
                         st.warning("⚠️ Insufficient complete cases to extract factors. Please ensure items have at least 3 complete responses.")
+
+            # Tool 4: CFA / SEM
+            elif stat_submode == "Confirmatory Factor Analysis (CFA / SEM)":
+                st.markdown("##### 🏛️ Confirmatory Factor Analysis (CFA) & Latent Structural Equation Modeling (SEM)")
+                st.caption("Specify measurement models using standard formula syntax: `Factor =~ item1 + item2 + item3`. Regression paths can be added with `Y ~ X1 + X2`.")
+                
+                sample_cols = [c for c in num_cols_analysis if df_cleaned[c].std(ddof=1) > 0][:6]
+                if len(sample_cols) >= 4:
+                    half = len(sample_cols) // 2
+                    default_sem = f"F1 =~ {' + '.join(sample_cols[:half])}\nF2 =~ {' + '.join(sample_cols[half:])}"
+                elif len(sample_cols) >= 2:
+                    default_sem = f"F1 =~ {' + '.join(sample_cols)}"
+                else:
+                    default_sem = "# Example:\n# Factor1 =~ Item1 + Item2 + Item3"
+                    
+                sem_desc = st.text_area("Model Specification Syntax (semopy / lavaan format):", value=default_sem, height=130)
+                if st.button("🚀 Estimate CFA / SEM Model", key="btn_run_sem", use_container_width=True):
+                    if sem_desc.strip():
+                        with st.spinner("Fitting structural equation model..."):
+                            sem_res = engine.compute_sem_cfa(df_cleaned, sem_desc)
+                        if sem_res.get("error"):
+                            st.error(sem_res["error"])
+                        elif sem_res.get("is_success"):
+                            st.success(f"✅ Model converged successfully on N = {sem_res['n_obs']} complete cases!")
+                            
+                            fit_stats = sem_res.get("fit_stats", {})
+                            if fit_stats:
+                                st.write("###### Global Goodness-of-Fit Indices:")
+                                f_cols = st.columns(min(6, len(fit_stats)))
+                                col_idx = 0
+                                for metric_name, val in list(fit_stats.items())[:6]:
+                                    with f_cols[col_idx % len(f_cols)]:
+                                        st.metric(metric_name, f"{val:.4f}" if isinstance(val, (int, float)) else str(val))
+                                    col_idx += 1
+                                st.caption("Benchmark Criteria: CFI/TLI ≥ .90 (Acceptable), ≥ .95 (Good fit); RMSEA ≤ .08 (Acceptable), ≤ .05 (Close fit).")
+                                
+                            st.write("###### Parameter Estimates (Factor Loadings & Structural Paths):")
+                            st.dataframe(sem_res["estimates"], use_container_width=True)
+                    else:
+                        st.warning("Please enter a valid model syntax formula.")
+
+            # Tool 5: Multi-Level HLM
+            elif stat_submode == "Multi-Level Hierarchical Linear Modeling (HLM)":
+                st.markdown("##### 🏢 Multi-Level Hierarchical Linear Modeling (HLM / Mixed-Effects)")
+                st.caption("Model nested data structures (e.g. employees nested within departments or schools). Estimates random intercept variance (τ₀₀), residual variance (σ²), and Intraclass Correlation Coefficient (ICC).")
+                
+                hlm_y = st.selectbox("Select Dependent Variable (Y):", options=num_cols_analysis, key="hlm_y")
+                hlm_preds_opts = [c for c in num_cols_analysis if c != hlm_y]
+                hlm_x = st.multiselect("Select Fixed Predictors (X):", options=hlm_preds_opts, default=hlm_preds_opts[:min(2, len(hlm_preds_opts))], key="hlm_x")
+                hlm_grp_opts = [c for c in all_cols_analysis if c != hlm_y]
+                hlm_group = st.selectbox("Select Cluster / Grouping Variable (Level-2 Group):", options=hlm_grp_opts, key="hlm_grp")
+                hlm_slopes = st.multiselect("Optional: Random Slopes (Predictors whose slopes vary by group):", options=hlm_x, key="hlm_slopes")
+                
+                if st.button("🚀 Fit Multi-Level Model", key="btn_run_hlm", use_container_width=True):
+                    if hlm_y and hlm_x and hlm_group:
+                        with st.spinner("Fitting multi-level mixed-effects model..."):
+                            hlm_res = engine.compute_multilevel_hlm(df_cleaned, hlm_y, hlm_x, hlm_group, random_slopes=hlm_slopes)
+                        if hlm_res.get("error"):
+                            st.error(hlm_res["error"])
+                        elif hlm_res.get("is_success"):
+                            st.success(f"✅ Model converged successfully on N = {hlm_res['n_obs']} observations across {hlm_res['n_groups']} clusters!")
+                            
+                            h1, h2, h3, h4 = st.columns(4)
+                            with h1: st.metric("Intraclass Corr (ICC)", f"{hlm_res['icc']:.4f}", help="Proportion of total variance explained by between-group clustering")
+                            with h2: st.metric("Clusters / Groups", f"{hlm_res['n_groups']}")
+                            with h3: st.metric("Model AIC", f"{hlm_res['aic']}")
+                            with h4: st.metric("Model BIC", f"{hlm_res['bic']}")
+                            
+                            st.write("###### Fixed Effects Estimates:")
+                            st.dataframe(hlm_res["fixed_effects"], hide_index=True, use_container_width=True)
+                            
+                            st.write("###### Variance Components (Random Intercepts & Residual):")
+                            st.dataframe(hlm_res["random_effects"], hide_index=True, use_container_width=True)
+                            
+                            if hlm_res['icc'] > 0.05:
+                                st.info(f"💡 **Substantive Clustering**: An ICC of {hlm_res['icc']:.1%} indicates meaningful between-cluster variance. Standard OLS regression would underestimate standard errors; HLM is strongly warranted.")
+                    else:
+                        st.warning("Please select a dependent variable, at least 1 predictor, and a cluster variable.")
+
+            # Tool 6: Repeated-Measures ANOVA
+            elif stat_submode == "Repeated-Measures ANOVA":
+                st.markdown("##### ⏱️ Repeated-Measures & Mixed ANOVA")
+                st.caption("Analyze within-subject changes across repeated assessment occasions (e.g., Pre-test, Post-test, Follow-up) with Mauchly's sphericity test and Bonferroni post-hoc tests.")
+                
+                rm_cols = st.multiselect("Select Repeated Measurements (Within-Subject Occasions / Times):", options=num_cols_analysis, default=num_cols_analysis[:min(3, len(num_cols_analysis))], key="rm_cols")
+                between_opts = ["(None - Pure Within-Subject Design)"] + [c for c in all_cols_analysis if c not in rm_cols]
+                between_factor = st.selectbox("Optional: Between-Subject Factor (e.g. Treatment Group, Role, Gender):", options=between_opts, key="rm_between")
+                actual_between = None if between_factor.startswith("(") else between_factor
+                
+                if st.button("🚀 Run Repeated-Measures ANOVA", key="btn_run_rm", use_container_width=True):
+                    if len(rm_cols) >= 2:
+                        with st.spinner("Computing repeated-measures ANOVA..."):
+                            rm_res = engine.compute_repeated_measures_anova(df_cleaned, rm_cols, between_col=actual_between)
+                        if rm_res.get("error"):
+                            st.error(rm_res["error"])
+                        elif rm_res.get("is_success"):
+                            st.success(f"✅ Repeated-measures analysis complete on N = {rm_res['n_subjects']} subjects across {len(rm_cols)} conditions!")
+                            
+                            st.write("###### ANOVA Summary Table:")
+                            st.dataframe(rm_res["aov_table"], use_container_width=True)
+                            
+                            if rm_res.get("sphericity"):
+                                sph = rm_res["sphericity"]
+                                met = sph["sphericity_met"]
+                                sph_msg = (
+                                    f"✅ **Mauchly's Sphericity Met** (W = {sph['sphericity_w']:.3f}, p = {sph['p_value']:.4f}). "
+                                    f"Standard within-subject F-tests are valid without adjustment."
+                                    if met else
+                                    f"⚠️ **Sphericity Violated** (W = {sph['sphericity_w']:.3f}, p = {sph['p_value']:.4f} < .05). "
+                                    f"Please interpret the Greenhouse-Geisser (GG) or Huynh-Feldt (HF) corrected p-values from the ANOVA table above."
+                                )
+                                if met:
+                                    st.success(sph_msg)
+                                else:
+                                    st.warning(sph_msg)
+                                    
+                            if rm_res.get("posthoc") is not None and len(rm_res["posthoc"]) > 0:
+                                st.write("###### Bonferroni Post-Hoc Pairwise Comparisons:")
+                                st.dataframe(rm_res["posthoc"], hide_index=True, use_container_width=True)
+                    else:
+                        st.warning("Please select at least 2 repeated measurement occasions.")
+
+            # Tool 7: Binary Logistic Regression
+            elif stat_submode == "Binary Logistic Regression":
+                st.markdown("##### 🎯 Binary Logistic Regression")
+                st.caption("Estimate Odds Ratios (e^B) and probability of binary outcomes (e.g. Promotion, Retention, Compliance).")
+                
+                binary_candidates = [c for c in all_cols_analysis if df_cleaned[c].dropna().nunique() == 2]
+                target_opts = binary_candidates if binary_candidates else all_cols_analysis
+                logit_y = st.selectbox("Select Binary Dependent Variable (Y):", options=target_opts, key="logit_y")
+                logit_x_opts = [c for c in num_cols_analysis if c != logit_y]
+                logit_x = st.multiselect("Select Predictor Variables (X):", options=logit_x_opts, default=logit_x_opts[:min(3, len(logit_x_opts))], key="logit_x")
+                
+                if st.button("🚀 Fit Logistic Regression Model", key="btn_run_logit", use_container_width=True):
+                    if logit_y and logit_x:
+                        with st.spinner("Estimating logistic regression..."):
+                            logit_res = engine.compute_logistic_regression(df_cleaned, logit_y, logit_x)
+                        if logit_res.get("error"):
+                            st.error(logit_res["error"])
+                        elif logit_res.get("is_success"):
+                            st.success(f"✅ Logistic regression converged on N = {logit_res['n_obs']} observations!")
+                            
+                            l1, l2, l3, l4 = st.columns(4)
+                            with l1: st.metric("McFadden's Pseudo R²", f"{logit_res['pseudo_r2']}")
+                            with l2: st.metric("Classification Accuracy", f"{logit_res['accuracy']}%")
+                            with l3: st.metric("Log-Likelihood", f"{logit_res['log_likelihood']}")
+                            with l4: st.metric("LR Test p-value", f"{logit_res['lr_pvalue']}")
+                            
+                            st.write("###### Predictor Odds Ratios & Parameter Estimates:")
+                            st.dataframe(logit_res["table"], hide_index=True, use_container_width=True)
+                            st.caption("Interpretation: Odds Ratio > 1 indicates increased likelihood of target event per unit increase in predictor; < 1 indicates reduced likelihood.")
+                    else:
+                        st.warning("Please select a binary outcome and at least 1 predictor variable.")
+
+            # Tool 8: Cox Proportional Hazards
+            elif stat_submode == "Cox Proportional Hazards (Survival)":
+                st.markdown("##### ⏳ Cox Proportional Hazards Survival Analysis")
+                st.caption("Model time-to-event outcomes with right-censoring (e.g. tenure until departure, time to task completion). Reports Hazard Ratios (HR) and Harrell's Concordance Index.")
+                
+                surv_dur = st.selectbox("Select Time-to-Event / Duration Column:", options=num_cols_analysis, key="surv_dur")
+                binary_candidates = [c for c in all_cols_analysis if df_cleaned[c].dropna().nunique() == 2]
+                event_opts = binary_candidates if binary_candidates else [c for c in all_cols_analysis if c != surv_dur]
+                surv_event = st.selectbox("Select Event / Status Indicator (1 = Event Occurred, 0 = Censored):", options=event_opts, key="surv_ev")
+                surv_x_opts = [c for c in num_cols_analysis if c not in [surv_dur, surv_event]]
+                surv_x = st.multiselect("Select Covariates / Risk Factors:", options=surv_x_opts, default=surv_x_opts[:min(3, len(surv_x_opts))], key="surv_x")
+                
+                if st.button("🚀 Fit Cox Proportional Hazards Model", key="btn_run_cox", use_container_width=True):
+                    if surv_dur and surv_event and surv_x:
+                        with st.spinner("Fitting Cox proportional hazards model..."):
+                            cox_res = engine.compute_cox_survival(df_cleaned, surv_dur, surv_event, surv_x)
+                        if cox_res.get("error"):
+                            st.error(cox_res["error"])
+                        elif cox_res.get("is_success"):
+                            st.success(f"✅ Survival model converged on N = {cox_res['n_obs']} cases ({cox_res['n_events']} events observed)!")
+                            
+                            c1, c2, c3, c4 = st.columns(4)
+                            with c1: st.metric("Concordance Index (C-index)", f"{cox_res['concordance_index']:.4f}", help="Discriminative accuracy: 0.5 = chance, 1.0 = perfect prediction")
+                            with c2: st.metric("Events Observed", f"{cox_res['n_events']}")
+                            with c3: st.metric("Partial AIC", f"{cox_res['aic']}")
+                            with c4: st.metric("Log-Likelihood", f"{cox_res['log_likelihood']}")
+                            
+                            st.write("###### Hazard Ratios (HR = e^B) & Covariate Estimates:")
+                            st.dataframe(cox_res["table"], hide_index=True, use_container_width=True)
+                            st.caption("Interpretation: Hazard Ratio (HR) > 1 indicates increased hazard/risk per unit increase in covariate; HR < 1 indicates protective effect.")
+                    else:
+                        st.warning("Please select a duration metric, an event indicator, and at least 1 covariate.")
+
         else:
             st.info("At least 2 numeric variables are needed for statistical analysis.")
 
