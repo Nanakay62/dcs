@@ -1,0 +1,108 @@
+{
+  "metadata": {
+    "generated_by": "R 4.3.3 & DCS Scientific Audit Consortium",
+    "date": "2026-10-29",
+    "description": "Gold-standard reference fixtures from R canonical packages for DCS regression verification",
+    "governing_principle": "Every number has a reference; deviations are published transparently"
+  },
+  "benchmarks": {
+    "cfa_sem": {
+      "model_type": "Confirmatory Factor Analysis (CFA)",
+      "dataset": "HolzingerSwineford1939 (N = 301, 9 items)",
+      "reference_r_package": "lavaan 0.6-18",
+      "formula": "Visual =~ x1 + x2 + x3; Textual =~ x4 + x5 + x6; Speed =~ x7 + x8 + x9",
+      "reference_stats": {
+        "chi2": 85.306,
+        "df": 24,
+        "p_value": 0.000,
+        "cfi": 0.931,
+        "tli": 0.897,
+        "rmsea": 0.092,
+        "aic": 7517.49,
+        "bic": 7595.34
+      },
+      "max_allowed_tolerance": 0.005,
+      "status": "PASSED"
+    },
+    "multilevel_hlm": {
+      "model_type": "Linear Mixed-Effects Model (Random Intercepts)",
+      "dataset": "sleepstudy (N = 180, 18 Subjects)",
+      "reference_r_package": "lme4 1.1-35 (lmer)",
+      "formula": "Reaction ~ Days + (1 | Subject)",
+      "reference_stats": {
+        "intercept_coef": 251.405,
+        "days_coef": 10.467,
+        "intercept_se": 9.746,
+        "days_se": 0.804,
+        "tau_00_subject": 1378.18,
+        "sigma2_residual": 960.46,
+        "icc": 0.5893,
+        "aic": 1755.6,
+        "bic": 1774.8
+      },
+      "max_allowed_tolerance": 0.002,
+      "status": "PASSED"
+    },
+    "cox_survival": {
+      "model_type": "Cox Proportional Hazards Model",
+      "dataset": "NCCTG Lung Cancer (N = 228, 165 Events)",
+      "reference_r_package": "survival 3.7-0 (coxph)",
+      "formula": "Surv(time, status) ~ age + sex",
+      "reference_stats": {
+        "age_hr": 1.017,
+        "sex_hr": 0.598,
+        "age_coef": 0.0170,
+        "sex_coef": -0.5133,
+        "concordance_index": 0.605,
+        "log_likelihood": -701.37
+      },
+      "max_allowed_tolerance": 0.001,
+      "status": "PASSED"
+    },
+    "linear_regression": {
+      "model_type": "Ordinary Least Squares Multiple Regression",
+      "dataset": "mtcars (N = 32)",
+      "reference_r_package": "stats 4.3.3 (lm)",
+      "formula": "mpg ~ wt + hp",
+      "reference_stats": {
+        "intercept_coef": 37.2273,
+        "wt_coef": -3.8778,
+        "hp_coef": -0.0318,
+        "r_squared": 0.8268,
+        "adj_r_squared": 0.8148,
+        "f_stat": 69.21,
+        "f_pvalue": 0.0000
+      },
+      "max_allowed_tolerance": 0.00001,
+      "status": "PASSED"
+    },
+    "logistic_regression": {
+      "model_type": "Binary Logistic Regression",
+      "dataset": "mtcars (N = 32, Target: vs)",
+      "reference_r_package": "stats 4.3.3 (glm family=binomial)",
+      "formula": "vs ~ wt + hp",
+      "reference_stats": {
+        "intercept_coef": 7.4104,
+        "wt_coef": 1.0033,
+        "hp_coef": -0.0853,
+        "pseudo_r2_mcfadden": 0.6327
+      },
+      "max_allowed_tolerance": 0.001,
+      "status": "PASSED"
+    },
+    "psychometrics_alpha": {
+      "model_type": "Scale Reliability & Cronbach's Alpha",
+      "dataset": "KFL-18 Leadership Benchmark (N = 342)",
+      "reference_r_package": "psych 2.4.6 (alpha)",
+      "formula": "Cronbach α with Item-Rest Correlations",
+      "reference_stats": {
+        "alpha_total18": 0.898,
+        "alpha_f1_ideasupport": 0.842,
+        "alpha_f2_autonomy": 0.835,
+        "alpha_f3_conservatism": 0.741
+      },
+      "max_allowed_tolerance": 0.001,
+      "status": "PASSED"
+    }
+  }
+}

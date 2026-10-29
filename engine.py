@@ -769,6 +769,150 @@ def compute_alpha_with_item_deleted(df_items):
     }
 
 
+def compute_longstring(row):
+    """Calculates the maximum consecutive identical non-null responses in a row."""
+    vals = row.dropna().values
+    if len(vals) == 0:
+        return 0
+    max_len = 1
+    curr_len = 1
+    for i in range(1, len(vals)):
+        if vals[i] == vals[i - 1]:
+            curr_len += 1
+            if curr_len > max_len:
+                max_len = curr_len
+        else:
+            curr_len = 1
+    return max_len
+
+
+def sanitize_spreadsheet_formulas(df):
+    """
+    Prevents CSV / Spreadsheet Formula Injection (CWE-1236).
+    Prefixes any text cell beginning with '=', '+', '-', '@' with a single quote (').
+    Preserves negative numbers and standard numeric values.
+    """
+    cleaned = df.copy()
+    for col in cleaned.select_dtypes(include=['object', 'string']).columns:
+        cleaned[col] = cleaned[col].apply(
+            lambda val: f"'{val}" if isinstance(val, str) and val.startswith(('=', '+', '-', '@')) and not (val.startswith('-') and val[1:].replace('.', '', 1).isdigit()) else val
+        )
+    return cleaned
+
+
+def compute_careless_response_suite(df, item_cols, longstring_thresh=6, irv_percentile=5, mahalanobis_p=0.001, completion_time_col=None, min_time_seconds=None):
+    """
+    Comprehensive Careless Response & Inattentive Survey Quality Suite (aligned with R package 'careless').
+    Computes:
+    1. Longstring: Maximum run length of identical consecutive answers.
+    2. IRV (Intra-individual Response Variability): Standard deviation across scale items per respondent.
+       Low IRV flags straightlining; high IRV flags random alternating responding.
+    3. Mahalanobis Distance (D^2): Multivariate outlier detection with chi-square p-values.
+    4. Even-Odd Consistency: Split-half difference across scale items.
+    5. Speeding Flag: Flags respondents completing survey faster than min_time_seconds.
+    6. Careless_Flag: Composite flag for sensitivity analysis (Flag, Never Delete principle).
+    """
+    if not item_cols or len(item_cols) < 2:
+        return None
+
+    valid_cols = [c for c in item_cols if c in df.columns]
+    sub = df[valid_cols].apply(pd.to_numeric, errors='coerce')
+    n_resp, k_items = sub.shape
+
+    # 1. Longstring
+    longstrings = sub.apply(compute_longstring, axis=1)
+
+    # 2. IRV
+    irvs = sub.std(axis=1, ddof=1, skipna=True)
+    valid_irvs = irvs.dropna()
+    irv_low_cutoff = float(np.nanpercentile(valid_irvs, irv_percentile)) if len(valid_irvs) > 0 else 0.0
+    irv_high_cutoff = float(np.nanpercentile(valid_irvs, 100 - irv_percentile)) if len(valid_irvs) > 0 else 999.0
+
+    # 3. Mahalanobis D2
+    clean_cases = sub.dropna()
+    d2_series = pd.Series(np.nan, index=df.index)
+    d2_p_series = pd.Series(np.nan, index=df.index)
+
+    if len(clean_cases) > k_items:
+        try:
+            cov_mat = np.cov(clean_cases.values, rowvar=False)
+            inv_cov = np.linalg.pinv(cov_mat)
+            diff = clean_cases.values - clean_cases.mean().values
+            d2 = np.sum((diff @ inv_cov) * diff, axis=1)
+            p_vals = 1.0 - stats.chi2.cdf(d2, df=k_items)
+            d2_series.loc[clean_cases.index] = np.round(d2, 2)
+            d2_p_series.loc[clean_cases.index] = np.round(p_vals, 4)
+        except Exception:
+            pass
+
+    # 4. Even-Odd Consistency
+    even_odd_diff = pd.Series(np.nan, index=df.index)
+    if k_items >= 4:
+        even_cols = sub.columns[::2]
+        odd_cols = sub.columns[1::2]
+        even_means = sub[even_cols].mean(axis=1)
+        odd_means = sub[odd_cols].mean(axis=1)
+        even_odd_diff = np.abs(even_means - odd_means).round(3)
+
+    # Flags
+    flag_ls = (longstrings >= int(longstring_thresh))
+    flag_irv_low = (irvs <= irv_low_cutoff)
+    flag_irv_high = (irvs >= irv_high_cutoff)
+    flag_irv = flag_irv_low | flag_irv_high
+    flag_d2 = (d2_p_series < float(mahalanobis_p))
+
+    flag_speed = pd.Series(False, index=df.index)
+    if completion_time_col and completion_time_col in df.columns and min_time_seconds:
+        time_vals = pd.to_numeric(df[completion_time_col], errors='coerce')
+        flag_speed = (time_vals < float(min_time_seconds)) & time_vals.notna()
+
+    combined_flag = flag_ls | flag_irv | flag_d2 | flag_speed
+
+    reasons = []
+    for idx in df.index:
+        r_list = []
+        if flag_ls.loc[idx]: r_list.append(f"Longstring (≥{longstring_thresh})")
+        if flag_irv_low.loc[idx]: r_list.append(f"Low IRV (≤{irv_low_cutoff:.2f})")
+        if flag_irv_high.loc[idx]: r_list.append(f"High IRV (≥{irv_high_cutoff:.2f})")
+        if flag_d2.loc[idx]: r_list.append(f"Multivariate Outlier (p<{mahalanobis_p})")
+        if flag_speed.loc[idx]: r_list.append(f"Speeding (<{min_time_seconds}s)")
+        reasons.append(", ".join(r_list) if r_list else "Clean")
+
+    audit_df = pd.DataFrame({
+        "Respondent_Index": df.index,
+        "Items_Answered": sub.notna().sum(axis=1),
+        "Longstring": longstrings,
+        "IRV_SD": irvs.round(3),
+        "Mahalanobis_D2": d2_series,
+        "Mahalanobis_p": d2_p_series,
+        "Even_Odd_Diff": even_odd_diff,
+        "Careless_Flag": combined_flag.astype(int),
+        "Flag_Reasons": reasons,
+    })
+
+    return {
+        "audit_df": audit_df,
+        "n_total": n_resp,
+        "n_flagged": int(combined_flag.sum()),
+        "pct_flagged": round(100.0 * combined_flag.sum() / max(n_resp, 1), 1),
+        "clean_indices": list(df.index[~combined_flag]),
+        "flagged_indices": list(df.index[combined_flag]),
+        "breakdown": {
+            "longstring": int(flag_ls.sum()),
+            "irv_low": int(flag_irv_low.sum()),
+            "irv_high": int(flag_irv_high.sum()),
+            "mahalanobis": int(flag_d2.sum()),
+            "speeding": int(flag_speed.sum()),
+        },
+        "cutoffs": {
+            "longstring": int(longstring_thresh),
+            "irv_low": round(irv_low_cutoff, 3),
+            "irv_high": round(irv_high_cutoff, 3),
+            "mahalanobis_p": mahalanobis_p,
+        }
+    }
+
+
 def detect_survey_quality_issues(df_raw, item_cols, straightline_threshold=0.0):
     """
     Identifies careless responders (Straightliners) who entered zero variance
