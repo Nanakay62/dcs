@@ -1,11 +1,11 @@
 # Dycson Cleaning Studio (DCS)
 ### Universal Data Cleaning, Survey Intelligence & Statistical Analysis Platform
-**Built and Engineered by Nana Kwame Dickson**  
+**Built and Engineered by Nana Kwame Dickson | Inspired by Jennifer Mawuse**  
 🌐 **Live Application:** [dycsoncs.streamlit.app](https://dycsoncs.streamlit.app/)
 
 ---
 
-> **Dycson Cleaning Studio (DCS)** is an enterprise-grade data intelligence, forensic spreadsheet reconstruction, and statistical analysis platform engineered by **Nana Kwame Dickson**. It is designed to resolve complex spreadsheet corruptions, automate Likert scale harmonization, validate survey psychometrics, and execute live statistical modeling in both **Python** and **R**.
+> **Dycson Cleaning Studio (DCS)** is an enterprise-grade data intelligence, forensic spreadsheet reconstruction, and statistical analysis platform engineered by **Nana Kwame Dickson**, inspired by **Jennifer Mawuse**. It is designed to resolve complex spreadsheet corruptions, automate Likert scale harmonization, validate survey psychometrics, and execute live statistical modeling in both **Python** and **R**.
 
 
 

@@ -31,10 +31,22 @@ LOGO_BRAND = ASSETS_DIR / "logo_brand.jpg"
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Dycson Cleaning Studio | Nana Kwame Dickson",
+    page_title="Dycson Cleaning Studio",
     page_icon=str(LOGO_ICON) if LOGO_ICON.exists() else "📊",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+# Invisible HTML Meta Tags for Search Engines & Social Graph (Metadata only)
+st.markdown(
+    """
+    <head>
+        <meta name="description" content="Data cleaning and statistical analysis platform built by Nana Kwame Dickson, inspired by Jennifer Mawuse.">
+        <meta name="author" content="Nana Kwame Dickson">
+        <meta name="keywords" content="Data Cleaning, Statistical Analysis, Psychometrics, Survey Reconstruction, Nana Kwame Dickson, Jennifer Mawuse">
+    </head>
+    """,
+    unsafe_allow_html=True,
 )
 
 st.markdown(
@@ -123,15 +135,7 @@ else:
     st.sidebar.image("https://img.icons8.com/fluency/96/data-sheet.png", width=56)
 
 st.sidebar.markdown("### Dycson Cleaning Studio")
-st.sidebar.markdown(
-    """
-    <div style="background: #F1F5F9; border-left: 4px solid #3B82F6; padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; font-size: 0.84rem; color: #334155; line-height: 1.45;">
-        <b>Data Cleaning & Statistical Analysis Platform</b><br>
-        <span style="color: #64748B;">Built & engineered by <b>Nana Kwame Dickson</b> for forensic spreadsheet reconstruction, psychometrics, and automated analysis.</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.sidebar.caption("Universal Spreadsheet, Survey Intelligence & Statistical Platform")
 
 app_mode = st.sidebar.radio(
     "Navigate Studio:",
@@ -148,9 +152,7 @@ def render_footer():
     st.markdown(
         """
         <div class="footer-container">
-            <span class="footer-author">Dycson Cleaning Studio (DCS)</span> • Data Cleaning & Statistical Analysis Platform
-            <br>
-            <span style="font-size: 0.82rem; color: #475569;">Built & engineered by <b>Nana Kwame Dickson</b> for forensic spreadsheet reconstruction, survey psychometrics, and reproducible data intelligence. | <a href="https://dycsoncs.streamlit.app/" target="_blank" style="color: #2563EB; text-decoration: none; font-weight: 600;">dycsoncs.streamlit.app</a></span>
+            <span class="footer-author">Dycson Cleaning Studio (DCS)</span> • Universal Spreadsheet, Survey Intelligence & Statistical Platform
         </div>
         """,
         unsafe_allow_html=True,
@@ -160,8 +162,8 @@ def render_sidebar_footer():
     st.sidebar.markdown(
         """
         <div class="sidebar-footer">
-            <b>Dycson Cleaning Studio</b><br><span style="font-size: 0.78rem; color: #475569;">Built by <b>Nana Kwame Dickson</b></span>
-            <span style="font-size: 0.74rem; color: #64748B;">Data Cleaning & Analysis</span><br><a href="https://dycsoncs.streamlit.app/" target="_blank" style="font-size: 0.74rem; color: #2563EB; text-decoration: none; font-weight: 600;">dycsoncs.streamlit.app</a>
+            <b>Dycson Cleaning Studio</b><br>
+            <span style="font-size: 0.74rem; color: #64748B;">Universal Spreadsheet & Statistical Intelligence</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -174,7 +176,6 @@ def render_sidebar_footer():
 
 if app_mode.startswith("🎯"):
     st.markdown('<div class="main-header">🎯 KFL & CPE Survey Forensic Cleaning Studio</div>', unsafe_allow_html=True)
-    st.markdown('<div style="display: inline-block; background: #EFF6FF; border: 1px solid #BFDBFE; color: #1D4ED8; font-weight: 600; font-size: 0.82rem; padding: 3px 10px; border-radius: 9999px; margin-bottom: 8px;">🛡️ Data Cleaning & Statistical Analysis Platform • Built by Nana Kwame Dickson • <a href="https://dycsoncs.streamlit.app" target="_blank" style="color: #1D4ED8; text-decoration: underline;">dycsoncs.streamlit.app</a></div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="sub-header">'
         'Forensic reconstruction, psychometric validation, and statistical analysis for leadership & creativity survey cohorts '
@@ -634,7 +635,6 @@ if app_mode.startswith("🎯"):
 
 elif app_mode.startswith("🔍"):
     st.markdown('<div class="main-header">🔍 Universal Messy Excel & Survey Cleaning Studio</div>', unsafe_allow_html=True)
-    st.markdown('<div style="display: inline-block; background: #EFF6FF; border: 1px solid #BFDBFE; color: #1D4ED8; font-weight: 600; font-size: 0.82rem; padding: 3px 10px; border-radius: 9999px; margin-bottom: 8px;">🛠️ Data Cleaning & Statistical Analysis Platform • Built by Nana Kwame Dickson • <a href="https://dycsoncs.streamlit.app" target="_blank" style="color: #1D4ED8; text-decoration: underline;">dycsoncs.streamlit.app</a></div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="sub-header">'
         'Full forensic pipeline for <b>any</b> spreadsheet: auto-detects header rows, consolidates multiple tabs, '
@@ -981,11 +981,9 @@ elif app_mode.startswith("🔍"):
 
 else:
     st.markdown('<div class="main-header">📖 Dycson Cleaning Studio : User Guide</div>', unsafe_allow_html=True)
-    st.markdown('<div style="display: inline-block; background: #EFF6FF; border: 1px solid #BFDBFE; color: #1D4ED8; font-weight: 600; font-size: 0.82rem; padding: 3px 10px; border-radius: 9999px; margin-bottom: 8px;">📚 Platform Documentation • Built by Nana Kwame Dickson • <a href="https://dycsoncs.streamlit.app" target="_blank" style="color: #1D4ED8; text-decoration: underline;">dycsoncs.streamlit.app</a></div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="sub-header">'
-        'Comprehensive documentation, feature tour, statistical methodology, and step-by-step instructions. '
-        '<b>Author:</b> Nana Kwame Dickson.</div>',
+        'Comprehensive documentation, feature tour, statistical methodology, and step-by-step instructions.</div>',
         unsafe_allow_html=True,
     )
 
