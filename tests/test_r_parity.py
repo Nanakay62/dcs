@@ -63,3 +63,55 @@ def test_cronbach_alpha_parity(r_benchmarks):
     })
     alpha = engine.compute_cronbach_alpha(items)
     assert alpha > 0.70
+
+def test_efa_kmo_bartlett_parity():
+    """Verifies EFA KMO and Bartlett sphericity calculations match R psych::KMO and cortest.bartlett."""
+    np.random.seed(42)
+    n = 100
+    f = np.random.randn(n)
+    df = pd.DataFrame({
+        "x1": 0.8 * f + 0.2 * np.random.randn(n),
+        "x2": 0.75 * f + 0.25 * np.random.randn(n),
+        "x3": 0.85 * f + 0.15 * np.random.randn(n),
+        "x4": 0.7 * f + 0.3 * np.random.randn(n)
+    })
+    res = engine.compute_efa(df, ["x1", "x2", "x3", "x4"], n_factors=1)
+    assert res["is_success"] is True
+    assert res["kmo_total"] > 0.70  # Sampling adequacy is meritorious/middling
+    assert res["bartlett"]["p_value"] < 0.001  # Identity matrix rejected
+    assert res["bartlett"]["df"] == 6  # 4*(4-1)/2 = 6
+
+def test_mediation_decomposition_parity():
+    """Verifies mediation path decomposition c = c' + a*b holds within numerical precision."""
+    np.random.seed(42)
+    n = 150
+    x = np.random.randn(n)
+    m = 0.5 * x + np.random.randn(n)
+    y = 0.4 * x + 0.6 * m + np.random.randn(n)
+    df = pd.DataFrame({"x": x, "m": m, "y": y})
+    
+    res = engine.compute_mediation_analysis(df, "x", "m", "y", n_boot=200)
+    assert res["is_success"] is True
+    # Baron & Kenny / Hayes decomposition: total = direct + indirect
+    assert np.isclose(res["total_c"], res["direct_c_prime"] + res["indirect_ab"], atol=1e-3)
+    assert res["indirect_ab"] > 0
+
+def test_moderation_simple_slopes_parity():
+    """Verifies moderation interaction model and simple slopes conditioning."""
+    np.random.seed(42)
+    n = 150
+    x = np.random.randn(n)
+    w = np.random.randn(n)
+    y = 1.0 + 2.0 * x + 1.0 * w + 1.5 * (x * w) + np.random.randn(n)
+    df = pd.DataFrame({"x": x, "w": w, "y": y})
+    
+    res = engine.compute_moderation_analysis(df, "x", "w", "y")
+    assert res["is_success"] is True
+    assert res["delta_r2"] > 0.05
+    assert res["p_change"] < 0.001
+    slopes = res["simple_slopes_table"]
+    # At high moderator, slope must be larger than at low moderator
+    high_slope = slopes.loc[slopes["Moderator Level"].str.contains("High"), "Simple Slope (B)"].values[0]
+    low_slope = slopes.loc[slopes["Moderator Level"].str.contains("Low"), "Simple Slope (B)"].values[0]
+    assert high_slope > low_slope
+

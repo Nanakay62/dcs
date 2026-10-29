@@ -23,3 +23,7 @@ Thumbs.db
 # IDEs
 .vscode/
 .idea/
+
+# Scratch & temporary testing directories
+scratch/
+.pytest_cache/

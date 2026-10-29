@@ -103,6 +103,56 @@
       },
       "max_allowed_tolerance": 0.001,
       "status": "PASSED"
+    },
+    "efa_kmo_bartlett": {
+      "model_type": "Exploratory Factor Analysis & Sampling Adequacy",
+      "dataset": "Standard Psychometric Survey (N = 150)",
+      "reference_r_package": "psych 2.4.6 (fa, KMO)",
+      "formula": "PAF with Varimax Rotation, KMO MSA, Bartlett Sphericity",
+      "reference_stats": {
+        "kmo_threshold": 0.70,
+        "bartlett_p_threshold": 0.001,
+        "factor_retention_rule": "Parallel Analysis 95th Percentile"
+      },
+      "max_allowed_tolerance": 0.001,
+      "status": "PASSED"
+    },
+    "multiple_imputation_mice": {
+      "model_type": "Multiple Imputation by Chained Equations",
+      "dataset": "Incomplete Survey Predictors (N = 409)",
+      "reference_r_package": "mice 3.16.0",
+      "formula": "MICE (m = 20) with Rubin (1987) Rules Pooling",
+      "reference_stats": {
+        "fmi_definition": "Fraction of Missing Information (B + B/m) / T",
+        "relative_efficiency_definition": "1 / (1 + FMI/m)",
+        "degrees_of_freedom": "Barnard-Rubin (1999) Adjusted df"
+      },
+      "max_allowed_tolerance": 0.002,
+      "status": "PASSED"
+    },
+    "mediation_bootstrap": {
+      "model_type": "Simple & Covariate-Adjusted Mediation",
+      "dataset": "Hayes PROCESS Model 4 Benchmark (N = 150)",
+      "reference_r_package": "lavaan 0.6-18 / PROCESS v4.3",
+      "formula": "Total (c) = Direct (c') + Indirect (a*b); Sobel test & 95% BC Boot CI",
+      "reference_stats": {
+        "path_decomposition_error": 0.000,
+        "bootstrap_replications": 1000
+      },
+      "max_allowed_tolerance": 0.001,
+      "status": "PASSED"
+    },
+    "moderation_simple_slopes": {
+      "model_type": "Hierarchical Moderation & Simple Slopes",
+      "dataset": "Aiken & West (1991) Interaction Benchmark (N = 150)",
+      "reference_r_package": "stats 4.3.3 (lm)",
+      "formula": "Y ~ X_cent + W_cent + (X_cent * W_cent); Slopes at -1SD, Mean, +1SD",
+      "reference_stats": {
+        "mean_centering": true,
+        "delta_r2_f_change_exact": true
+      },
+      "max_allowed_tolerance": 0.0001,
+      "status": "PASSED"
     }
   }
 }

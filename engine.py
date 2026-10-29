@@ -909,7 +909,8 @@ def compute_careless_response_suite(df, item_cols, longstring_thresh=6, irv_perc
             "irv_low": round(irv_low_cutoff, 3),
             "irv_high": round(irv_high_cutoff, 3),
             "mahalanobis_p": mahalanobis_p,
-        }
+        },
+        "is_success": True
     }
 
 
@@ -1721,6 +1722,1038 @@ def compute_cox_survival(df, duration_col, event_col, covariates):
         }
     except Exception as e:
         return {"error": f"Cox Proportional Hazards estimation failed: {str(e)}"}
+
+
+
+
+
+
+# ===========================================================================
+# Milestone B: Principled Missing Data, Advanced Psychometrics & Causal Modeling
+# ===========================================================================
+
+def _patch_factor_analyzer_compat():
+    """Ensures compatibility between factor_analyzer and modern scikit-learn (>= 1.6)."""
+    try:
+        import sklearn.utils.validation
+        import factor_analyzer.factor_analyzer as fa_mod
+        _orig_check = sklearn.utils.validation.check_array
+        def _safe_check(*args, **kwargs):
+            if 'force_all_finite' in kwargs:
+                kwargs['ensure_all_finite'] = kwargs.pop('force_all_finite')
+            return _orig_check(*args, **kwargs)
+        fa_mod.check_array = _safe_check
+        sklearn.utils.validation.check_array = _safe_check
+    except Exception:
+        pass
+
+
+def compute_missingness_patterns(df, cols=None):
+    """
+    Diagnoses missingness patterns across survey variables.
+    Identifies unique missing-data masks, case counts, per-variable rates,
+    and returns plain-language guidance on MCAR, MAR, and MNAR (Little & Rubin, 2019).
+    """
+    if df is None or df.empty:
+        return {"error": "Input dataframe is empty or invalid."}
+
+    if cols is None:
+        cols = [c for c in df.columns if df[c].isna().any()]
+    else:
+        cols = [c for c in cols if c in df.columns]
+
+    if not cols:
+        return {
+            "is_empty": True,
+            "message": "No missing data detected across the analyzed variables. Complete-case analysis is fully valid."
+        }
+
+    sub_df = df[cols].copy()
+    n_total = len(sub_df)
+
+    # 1. Per-variable missingness
+    var_records = []
+    for c in cols:
+        n_miss = int(sub_df[c].isna().sum())
+        n_valid = n_total - n_miss
+        pct_miss = round(100.0 * n_miss / n_total, 2)
+        var_records.append({
+            "Variable": c,
+            "Missing Cases (N)": n_miss,
+            "Missing Rate (%)": pct_miss,
+            "Valid Cases (N)": n_valid
+        })
+    df_var_missing = pd.DataFrame(var_records).sort_values("Missing Cases (N)", ascending=False).reset_index(drop=True)
+
+    # 2. Pattern analysis
+    # Mask: 0 = Observed, 1 = Missing
+    mask_matrix = sub_df.isna().astype(int)
+    pattern_series = mask_matrix.apply(lambda row: "".join(row.astype(str)), axis=1)
+    pattern_counts = pattern_series.value_counts()
+
+    pattern_records = []
+    cum_pct = 0.0
+    for idx, (pat_str, count) in enumerate(pattern_counts.items(), start=1):
+        pct = round(100.0 * count / n_total, 2)
+        cum_pct = round(cum_pct + pct, 2)
+        readable_desc = ", ".join([cols[i] for i, char in enumerate(pat_str) if char == "1"])
+        if not readable_desc:
+            readable_desc = "Complete Case (No Missing Values)"
+        else:
+            readable_desc = f"Missing in: {readable_desc}"
+
+        pattern_records.append({
+            "Pattern #": f"Pattern {idx}",
+            "Missing Variables": readable_desc,
+            "Pattern Binary Mask": pat_str,
+            "Cases (N)": count,
+            "Percentage (%)": pct,
+            "Cumulative (%)": min(cum_pct, 100.0)
+        })
+    df_patterns = pd.DataFrame(pattern_records)
+
+    # Guidance text
+    guidance = (
+        "**Methodological Diagnostic (Little & Rubin, 2019):**\n"
+        "- **MCAR (Missing Completely at Random):** Missingness is purely random and independent of observed and unobserved data. "
+        "Complete-case analysis is unbiased but discards valuable statistical power.\n"
+        "- **MAR (Missing at Random):** Missingness is systematically related to observed survey variables (e.g., tenure, age, branch). "
+        "Complete-case deletion introduces systematic sample-selection bias. Multiple Imputation (MICE) or Full Information Maximum Likelihood (FIML) "
+        "is required to yield unbiased estimates and valid standard errors.\n"
+        "- **MNAR (Missing Not at Random):** Missingness is related to the unobserved values themselves (e.g., sensitive performance or income non-response). "
+        "Requires sensitivity analyses comparing Complete-Case vs. MICE-imputed estimates."
+    )
+
+    return {
+        "df_var_missing": df_var_missing,
+        "df_patterns": df_patterns,
+        "total_patterns": len(pattern_counts),
+        "total_cases": n_total,
+        "complete_cases": int((sub_df.isna().sum(axis=1) == 0).sum()),
+        "guidance": guidance,
+        "is_success": True
+    }
+
+
+def compute_multiple_imputation_m2(df, model_type='linear', y_col=None, x_cols=None, m=20, random_state=42):
+    """
+    Multiple Imputation by Chained Equations (MICE) with Rubin's (1987) Rules Pooling.
+    Supports Linear (OLS) and Binary Logistic Regression models.
+    Produces side-by-side Complete-Case vs. MICE-Pooled sensitivity tables with Fraction of
+    Missing Information (FMI) and Relative Efficiency (RE).
+    """
+    if df is None or df.empty:
+        return {"error": "Input dataframe is empty or invalid."}
+    if not y_col or y_col not in df.columns:
+        return {"error": f"Dependent variable '{y_col}' not found in dataframe."}
+    if not x_cols or not isinstance(x_cols, list):
+        return {"error": "Predictor variables (x_cols) must be a non-empty list."}
+
+    valid_x = [c for c in x_cols if c in df.columns and c != y_col]
+    if not valid_x:
+        return {"error": "No valid predictor variables selected."}
+
+    # Ensure experimental iterative imputer is imported
+    try:
+        from sklearn.experimental import enable_iterative_imputer
+        from sklearn.impute import IterativeImputer
+    except Exception as e:
+        return {"error": f"Failed to load sklearn IterativeImputer: {str(e)}"}
+
+    import statsmodels.api as sm
+
+    # Prepare numeric subset
+    all_vars = [y_col] + valid_x
+    sub_df = df[all_vars].apply(pd.to_numeric, errors="coerce")
+
+    # MID rule (von Hippel, 2007): filter to cases where Y is observed
+    sub_df = sub_df.dropna(subset=[y_col]).copy()
+    n_sub = len(sub_df)
+    if n_sub < len(valid_x) + 5:
+        return {"error": f"Insufficient sample size ({n_sub} cases with observed outcome). Need at least {len(valid_x) + 5}."}
+
+    # Complete Case Model (Listwise Deletion)
+    df_cc = sub_df.dropna().copy()
+    n_cc = len(df_cc)
+    if n_cc < len(valid_x) + 2:
+        return {"error": f"Too few complete cases ({n_cc}) to estimate baseline listwise deletion model."}
+
+    X_cc = sm.add_constant(df_cc[valid_x])
+    y_cc = df_cc[y_col]
+
+    try:
+        if model_type == "logistic":
+            cc_model = sm.Logit(y_cc, X_cc).fit(disp=False)
+        else:
+            cc_model = sm.OLS(y_cc, X_cc).fit()
+    except Exception as e:
+        return {"error": f"Complete-case baseline model failed to converge: {str(e)}"}
+
+    cc_params = cc_model.params
+    cc_bse = cc_model.bse
+    cc_pvalues = cc_model.pvalues
+
+    # MICE Multiple Imputations & Rubin's Rules
+    m = max(5, int(m))
+    q_list = []
+    u_list = []
+
+    for k in range(m):
+        imputer = IterativeImputer(
+            max_iter=10,
+            sample_posterior=True,
+            random_state=random_state + k
+        )
+        try:
+            imputed_arr = imputer.fit_transform(sub_df)
+            df_k = pd.DataFrame(imputed_arr, columns=all_vars)
+            X_k = sm.add_constant(df_k[valid_x])
+            y_k = df_k[y_col]
+
+            if model_type == "logistic":
+                fit_k = sm.Logit(y_k, X_k).fit(disp=False)
+            else:
+                fit_k = sm.OLS(y_k, X_k).fit()
+
+            q_list.append(fit_k.params)
+            u_list.append(fit_k.bse ** 2)
+        except Exception:
+            continue
+
+    actual_m = len(q_list)
+    if actual_m < 3:
+        return {"error": f"MICE imputation failed to converge on sufficient datasets ({actual_m}/{m} completed)."}
+
+    # Rubin's (1987) Pooling
+    Q_matrix = np.array(q_list)  # (m, p)
+    U_matrix = np.array(u_list)  # (m, p)
+
+    Q_bar = np.mean(Q_matrix, axis=0)
+    U_bar = np.mean(U_matrix, axis=0)
+    B = np.var(Q_matrix, axis=0, ddof=1)
+    T = U_bar + (1.0 + 1.0 / actual_m) * B
+    se_pool = np.sqrt(np.maximum(T, 1e-12))
+    t_pool = Q_bar / se_pool
+
+    # FMI & Relative Efficiency
+    r = (1.0 + 1.0 / actual_m) * B / np.maximum(U_bar, 1e-12)
+    nu_old = (actual_m - 1.0) * (1.0 + 1.0 / np.maximum(r, 1e-12)) ** 2
+    fmi = np.clip((r + 2.0 / (nu_old + 3.0)) / (1.0 + r), 0.0, 1.0)
+    re_eff = 1.0 / (1.0 + fmi / actual_m)
+
+    # Barnard & Rubin (1999) Degrees of Freedom adjustment
+    nu_com = max(1, n_sub - (len(valid_x) + 1))
+    nu_obs = ((nu_com + 1.0) / (nu_com + 3.0)) * nu_com * (1.0 - fmi)
+    nu_adj = np.where(nu_old + nu_obs > 0, (nu_old * nu_obs) / np.maximum(nu_old + nu_obs, 1e-12), nu_com)
+    nu_adj = np.maximum(nu_adj, 1.0)
+
+    p_pool = 2.0 * (1.0 - stats.t.cdf(np.abs(t_pool), df=nu_adj))
+    t_crit = stats.t.ppf(0.975, df=nu_adj)
+    ci_lower = Q_bar - t_crit * se_pool
+    ci_upper = Q_bar + t_crit * se_pool
+
+    # Format side-by-side comparison table
+    param_names = list(cc_params.index)
+    comparison_rows = []
+    for idx, p_name in enumerate(param_names):
+        b_cc = cc_params.get(p_name, np.nan)
+        se_c = cc_bse.get(p_name, np.nan)
+        p_c = cc_pvalues.get(p_name, np.nan)
+
+        b_mice = Q_bar[idx]
+        se_m = se_pool[idx]
+        p_m = p_pool[idx]
+        delta_b = b_mice - b_cc if pd.notna(b_cc) else np.nan
+
+        star_cc = "***" if p_c < 0.001 else ("**" if p_c < 0.01 else ("*" if p_c < 0.05 else ""))
+        star_mice = "***" if p_m < 0.001 else ("**" if p_m < 0.01 else ("*" if p_m < 0.05 else ""))
+
+        comparison_rows.append({
+            "Predictor": "Intercept" if p_name == "const" else p_name,
+            "Complete-Case Coef (B)": round(b_cc, 4) if pd.notna(b_cc) else np.nan,
+            "Complete-Case SE": round(se_c, 4) if pd.notna(se_c) else np.nan,
+            "Complete-Case p": f"{p_c:.4f} {star_cc}".strip() if pd.notna(p_c) else "",
+            "MICE Pooled Coef (B)": round(b_mice, 4),
+            "MICE Pooled SE": round(se_m, 4),
+            "MICE Pooled p": f"{p_m:.4f} {star_mice}".strip(),
+            "Coef Shift (ΔB)": round(delta_b, 4),
+            "FMI": round(float(fmi[idx]), 3),
+            "Relative Efficiency": round(float(re_eff[idx]), 4),
+            "95% CI Lower": round(float(ci_lower[idx]), 4),
+            "95% CI Upper": round(float(ci_upper[idx]), 4)
+        })
+
+    df_comp = pd.DataFrame(comparison_rows)
+
+    return {
+        "comparison_table": df_comp,
+        "n_total": len(df),
+        "n_observed_y": n_sub,
+        "n_complete_cases": n_cc,
+        "m_imputations_requested": m,
+        "m_imputations_completed": actual_m,
+        "model_type": model_type,
+        "is_success": True
+    }
+
+
+def compute_efa(df, items, n_factors=2, method='principal', rotation='varimax'):
+    """
+    Exploratory Factor Analysis (EFA) via factor_analyzer.
+    Computes KMO sampling adequacy, Bartlett's test of sphericity,
+    Horn's Parallel Analysis, factor loadings, and factor correlations.
+    """
+    _patch_factor_analyzer_compat()
+
+    if df is None or df.empty:
+        return {"error": "Dataframe is empty or invalid."}
+    if not items or len(items) < 2:
+        return {"error": "At least 2 items are required for factor analysis."}
+
+    valid_items = [c for c in items if c in df.columns]
+    if len(valid_items) < 2:
+        return {"error": "Fewer than 2 valid item columns present in dataframe."}
+
+    clean = df[valid_items].apply(pd.to_numeric, errors="coerce").dropna().copy()
+    n_obs = len(clean)
+    p_vars = len(valid_items)
+
+    if n_obs < p_vars:
+        return {"error": f"Insufficient complete cases ({n_obs}) for {p_vars} items. N must exceed number of variables."}
+
+    try:
+        from factor_analyzer import FactorAnalyzer, calculate_kmo, calculate_bartlett_sphericity
+    except ImportError:
+        return {"error": "factor-analyzer package is required. Run 'pip install factor-analyzer'."}
+
+    # 1. KMO Sampling Adequacy
+    try:
+        kmo_per_var, kmo_total = calculate_kmo(clean)
+        kmo_eval = (
+            "Marvelous" if kmo_total >= 0.90 else
+            "Meritorious" if kmo_total >= 0.80 else
+            "Middling" if kmo_total >= 0.70 else
+            "Mediocre" if kmo_total >= 0.60 else
+            "Miserable" if kmo_total >= 0.50 else "Unacceptable"
+        )
+        kmo_table = pd.DataFrame({
+            "Item": valid_items,
+            "MSA": np.round(kmo_per_var, 3),
+            "Assessment": [
+                "Marvelous" if v >= 0.90 else "Meritorious" if v >= 0.80 else
+                "Middling" if v >= 0.70 else "Mediocre" if v >= 0.60 else
+                "Miserable" if v >= 0.50 else "Unacceptable (<0.50)" for v in kmo_per_var
+            ]
+        })
+    except Exception as e:
+        kmo_total = np.nan
+        kmo_eval = f"Calculation failed: {str(e)}"
+        kmo_table = pd.DataFrame()
+
+    # 2. Bartlett's Test of Sphericity
+    try:
+        chi_sq, p_val = calculate_bartlett_sphericity(clean)
+        df_bartlett = int(p_vars * (p_vars - 1) / 2)
+        bartlett_res = {
+            "chi2": round(float(chi_sq), 2),
+            "df": df_bartlett,
+            "p_value": float(p_val),
+            "is_significant": bool(p_val < 0.05)
+        }
+    except Exception as e:
+        bartlett_res = {"chi2": np.nan, "df": 0, "p_value": np.nan, "is_significant": False, "error": str(e)}
+
+    # 3. Horn's Parallel Analysis
+    try:
+        corr_mat = clean.corr().values
+        emp_eigvals, _ = np.linalg.eigh(corr_mat)
+        emp_eigvals = np.sort(emp_eigvals)[::-1]
+
+        # Simulate 50 random matrices
+        n_sim = 50
+        sim_eigvals = np.zeros((n_sim, p_vars))
+        np.random.seed(42)
+        for s in range(n_sim):
+            rand_mat = np.random.normal(size=(n_obs, p_vars))
+            r_corr = np.corrcoef(rand_mat, rowvar=False)
+            r_eig, _ = np.linalg.eigh(r_corr)
+            sim_eigvals[s, :] = np.sort(r_eig)[::-1]
+
+        random_p95 = np.percentile(sim_eigvals, 95, axis=0)
+        retain_flags = emp_eigvals > random_p95
+        parallel_rec = int(np.sum(retain_flags))
+
+        parallel_df = pd.DataFrame({
+            "Factor": [f"Factor {i+1}" for i in range(p_vars)],
+            "Empirical Eigenvalue": np.round(emp_eigvals, 3),
+            "95th Pct Random Eigenvalue": np.round(random_p95, 3),
+            "Retain Factor?": ["Retain" if f else "Drop" for f in retain_flags]
+        })
+    except Exception:
+        parallel_df = pd.DataFrame()
+        parallel_rec = n_factors
+
+    # 4. Fit FactorAnalyzer
+    method_norm = str(method).lower().strip()
+    if method_norm in ["pa", "paf", "principal"]:
+        fa_method = "principal"
+    elif method_norm in ["ml", "mle"]:
+        fa_method = "ml"
+    elif method_norm in ["minres"]:
+        fa_method = "minres"
+    elif method_norm in ["uls"]:
+        fa_method = "uls"
+    else:
+        fa_method = "principal"
+
+    rot_norm = None if rotation in [None, "none", "None"] else str(rotation).lower().strip()
+
+    n_factors = max(1, min(int(n_factors), p_vars))
+    fa = FactorAnalyzer(n_factors=n_factors, method=fa_method, rotation=rot_norm)
+    try:
+        fa.fit(clean)
+    except Exception as e:
+        return {"error": f"FactorAnalyzer estimation failed: {str(e)}"}
+
+    loadings = np.round(fa.loadings_, 3)
+    communalities = np.round(fa.get_communalities(), 3)
+    uniquenesses = np.round(fa.get_uniquenesses(), 3)
+
+    loadings_cols = [f"Factor {i+1}" for i in range(n_factors)]
+    df_loadings = pd.DataFrame(loadings, index=valid_items, columns=loadings_cols)
+    df_loadings["Communality (h²)"] = communalities
+    df_loadings["Uniqueness (u²)"] = uniquenesses
+    df_loadings = df_loadings.reset_index().rename(columns={"index": "Item"})
+
+    # Factor Variance
+    var_tuple = fa.get_factor_variance()
+    ss_loadings = np.round(var_tuple[0], 3)
+    prop_var = np.round(var_tuple[1] * 100.0, 2)
+    cum_var = np.round(var_tuple[2] * 100.0, 2)
+
+    df_var = pd.DataFrame({
+        "Metric": ["SS Loadings (Eigenvalues)", "Proportion of Variance (%)", "Cumulative Variance (%)"],
+        **{f"Factor {i+1}": [ss_loadings[i], prop_var[i], cum_var[i]] for i in range(n_factors)}
+    })
+
+    # Factor correlation matrix (for oblique rotations)
+    df_factor_corr = None
+    if rot_norm in ["promax", "oblimin"] and n_factors > 1:
+        try:
+            df_factor_corr = pd.DataFrame(
+                np.round(fa.phi_, 3),
+                index=loadings_cols,
+                columns=loadings_cols
+            )
+        except Exception:
+            df_factor_corr = None
+
+    return {
+        "loadings_table": df_loadings,
+        "variance_table": df_var,
+        "kmo_total": round(float(kmo_total), 3) if pd.notna(kmo_total) else np.nan,
+        "kmo_eval": kmo_eval,
+        "kmo_table": kmo_table,
+        "bartlett": bartlett_res,
+        "parallel_analysis_table": parallel_df,
+        "recommended_factors_parallel": parallel_rec,
+        "factor_correlations": df_factor_corr,
+        "n_obs": n_obs,
+        "n_factors": n_factors,
+        "method": fa_method,
+        "rotation": rot_norm or "None (Unrotated)",
+        "is_success": True
+    }
+
+
+def compute_advanced_psychometrics(df, construct_dict):
+    """
+    Construct Validity and Advanced Psychometric Evaluation.
+    Computes:
+    - Composite Reliability (CR / Raykov's rho)
+    - Average Variance Extracted (AVE)
+    - McDonald's Omega (ω)
+    - Cronbach's Alpha (α)
+    - Discriminant Validity via Fornell-Larcker Criterion
+    - Discriminant Validity via Heterotrait-Monotrait Ratio (HTMT < 0.85/0.90)
+    """
+    if df is None or df.empty or not construct_dict or not isinstance(construct_dict, dict):
+        return {"error": "Invalid dataframe or construct dictionary."}
+
+    valid_constructs = {}
+    for c_name, items in construct_dict.items():
+        existing = [item for item in items if item in df.columns]
+        if len(existing) >= 2:
+            valid_constructs[c_name] = existing
+
+    if len(valid_constructs) < 1:
+        return {"error": "At least one construct with 2 or more valid items is required."}
+
+    validity_rows = []
+    construct_scores = {}
+    construct_lambdas = {}
+
+    for c_name, items in valid_constructs.items():
+        sub = df[items].apply(pd.to_numeric, errors="coerce").dropna().copy()
+        if len(sub) < len(items):
+            continue
+
+        k = len(items)
+        alpha_val = compute_cronbach_alpha(sub)
+
+        # Standardized factor loadings via correlation principal eigenvector
+        corr = sub.corr().values
+        eigvals, eigvecs = np.linalg.eigh(corr)
+        max_idx = np.argmax(eigvals)
+        lambda_raw = eigvecs[:, max_idx] * np.sqrt(max(eigvals[max_idx], 0.0))
+
+        # Orient loadings positively (domain items load positively on scale construct)
+        if np.mean(lambda_raw) < 0:
+            lambda_raw = -lambda_raw
+        lambdas = np.clip(lambda_raw, 0.001, 0.999)
+        construct_lambdas[c_name] = lambdas
+
+        sum_lambda = float(np.sum(lambdas))
+        sum_lambda_sq = float(np.sum(lambdas ** 2))
+        sum_theta = float(np.sum(1.0 - (lambdas ** 2)))
+
+        # Composite Reliability (CR)
+        cr = (sum_lambda ** 2) / ((sum_lambda ** 2) + sum_theta)
+
+        # Average Variance Extracted (AVE)
+        ave = sum_lambda_sq / k
+
+        # McDonald's Omega (ω)
+        omega = (sum_lambda ** 2) / ((sum_lambda ** 2) + sum_theta)
+
+        # Save composite mean for discriminant correlations
+        construct_scores[c_name] = sub.mean(axis=1)
+
+        validity_rows.append({
+            "Construct": c_name,
+            "Items (k)": k,
+            "Cronbach α": round(float(alpha_val), 3) if pd.notna(alpha_val) else np.nan,
+            "Composite Reliability (CR)": round(float(cr), 3),
+            "Average Variance Extracted (AVE)": round(float(ave), 3),
+            "McDonald's Omega (ω)": round(float(omega), 3),
+            "CR Adequate (>= 0.70)": "Yes" if cr >= 0.70 else "No",
+            "Convergent Validity (AVE >= 0.50)": "Yes" if ave >= 0.50 else "No"
+        })
+
+    df_validity = pd.DataFrame(validity_rows)
+
+    # Discriminant Validity: Fornell-Larcker Criterion
+    construct_names = list(construct_scores.keys())
+    m_cons = len(construct_names)
+
+    # Calculate construct correlations
+    df_scores = pd.DataFrame(construct_scores)
+    corr_scores = df_scores.corr().values
+
+    fl_rows = []
+    for i, c1 in enumerate(construct_names):
+        row = {}
+        row["Construct"] = c1
+        c1_ave = [r["Average Variance Extracted (AVE)"] for r in validity_rows if r["Construct"] == c1][0]
+        sqrt_ave = np.sqrt(c1_ave)
+        for j, c2 in enumerate(construct_names):
+            if i == j:
+                row[c2] = f"{sqrt_ave:.3f}*"
+            else:
+                row[c2] = f"{corr_scores[i, j]:.3f}"
+        fl_rows.append(row)
+    df_fornell = pd.DataFrame(fl_rows)
+
+    # Discriminant Validity: HTMT (Heterotrait-Monotrait Ratio)
+    htmt_rows = []
+    for i in range(m_cons):
+        c1 = construct_names[i]
+        c1_items = valid_constructs[c1]
+        for j in range(i + 1, m_cons):
+            c2 = construct_names[j]
+            c2_items = valid_constructs[c2]
+
+            sub_pair = df[c1_items + c2_items].apply(pd.to_numeric, errors="coerce").dropna()
+            corr_pair = sub_pair.corr().abs()
+
+            # Heterotrait correlations
+            r_hetero = float(corr_pair.loc[c1_items, c2_items].values.mean())
+
+            # Monotrait correlations c1
+            mono1_vals = []
+            for a in range(len(c1_items)):
+                for b in range(a + 1, len(c1_items)):
+                    mono1_vals.append(corr_pair.loc[c1_items[a], c1_items[b]])
+            r_mono1 = float(np.mean(mono1_vals)) if mono1_vals else 1.0
+
+            # Monotrait correlations c2
+            mono2_vals = []
+            for a in range(len(c2_items)):
+                for b in range(a + 1, len(c2_items)):
+                    mono2_vals.append(corr_pair.loc[c2_items[a], c2_items[b]])
+            r_mono2 = float(np.mean(mono2_vals)) if mono2_vals else 1.0
+
+            denom = np.sqrt(max(r_mono1 * r_mono2, 1e-12))
+            htmt_val = r_hetero / denom
+
+            assessment = (
+                "Supported (< 0.85)" if htmt_val < 0.85 else
+                "Marginal (0.85 - 0.90)" if htmt_val <= 0.90 else
+                "Discriminant Validity Concern (> 0.90)"
+            )
+
+            htmt_rows.append({
+                "Construct Pair": f"{c1} <-> {c2}",
+                "HTMT Ratio": round(htmt_val, 3),
+                "Threshold (< 0.85)": "Met" if htmt_val < 0.85 else "Violated",
+                "Assessment": assessment
+            })
+    df_htmt = pd.DataFrame(htmt_rows)
+
+    return {
+        "validity_table": df_validity,
+        "fornell_larcker_table": df_fornell,
+        "htmt_table": df_htmt,
+        "is_success": True
+    }
+
+
+def recommend_cfa_estimator(df, items):
+    """
+    Estimator Advisor for Confirmatory Factor Analysis and Structural Equation Modeling.
+    Checks categorical levels, univariate skewness, and excess kurtosis.
+    Outputs evidence-based recommendation (ML, Robust ML / MLR, or Ordinal DWLS/WLSMV)
+    with academic reviewer citations (Rhemtulla et al., 2012; Finney & DiStefano, 2013).
+    """
+    if df is None or df.empty or not items:
+        return {"error": "Invalid dataframe or items list."}
+
+    valid_items = [c for c in items if c in df.columns]
+    if not valid_items:
+        return {"error": "None of the specified items exist in dataframe."}
+
+    sub = df[valid_items].apply(pd.to_numeric, errors="coerce")
+    records = []
+    has_ordinal_under_5 = False
+    has_severe_nonnormality = False
+
+    for col in valid_items:
+        s = sub[col].dropna()
+        n_unique = int(s.nunique())
+        skew_val = float(stats.skew(s)) if len(s) > 2 else 0.0
+        kurt_val = float(stats.kurtosis(s)) if len(s) > 3 else 0.0
+
+        if n_unique <= 5:
+            has_ordinal_under_5 = True
+        if abs(skew_val) > 2.0 or abs(kurt_val) > 7.0:
+            has_severe_nonnormality = True
+
+        records.append({
+            "Item": col,
+            "Valid N": int(len(s)),
+            "Unique Values": n_unique,
+            "Scale Type": "Ordinal Likert (<= 5 cats)" if n_unique <= 5 else "Continuous / Multi-point",
+            "Skewness": round(skew_val, 3),
+            "Excess Kurtosis": round(kurt_val, 3)
+        })
+
+    df_diag = pd.DataFrame(records)
+
+    if has_ordinal_under_5:
+        rec = "Ordinal Estimator: DWLS / WLSMV (Diagonally Weighted Least Squares)"
+        justification = (
+            "One or more scale items exhibit 5 or fewer ordered categories. "
+            "Under categorical Likert response formats, normal-theory ML produces severely attenuated factor loadings "
+            "and artificially deflated standard errors. Methodological consensus mandates polychoric-based DWLS/WLSMV."
+        )
+        citation = "Rhemtulla, M., Brosseau-Liard, P. É., & Savalei, V. (2012). When can categorical variables be treated as continuous? Psychological Methods, 17(3), 354–373."
+    elif has_severe_nonnormality:
+        rec = "Robust Maximum Likelihood: MLR (Satorra-Bentler Scaled Chi-Square)"
+        justification = (
+            "Items possess continuous scaling (> 5 categories) but violate multivariate normality (|skewness| > 2.0 "
+            "or |kurtosis| > 7.0). Standard ML inflates the model chi-square, leading to excessive type I error rates. "
+            "MLR applies Huber-White sandwich standard errors and mean-adjusted fit indices."
+        )
+        citation = "Finney, S. J., & DiStefano, C. (2013). Non-normal and categorical data in structural equation modeling. In G. R. Hancock & R. O. Mueller (Eds.), Structural Equation Modeling: A Second Course (2nd ed., pp. 439–492)."
+    else:
+        rec = "Standard Maximum Likelihood: ML"
+        justification = (
+            "Items have continuous scaling (> 5 categories) and satisfy univariate and multivariate normality assumptions "
+            "(|skewness| <= 2.0, |kurtosis| <= 7.0). Standard ML is the most statistically efficient and unbiased estimator."
+        )
+        citation = "Bollen, K. A. (1989). Structural Equations with Latent Variables. John Wiley & Sons."
+
+    return {
+        "recommended_estimator": rec,
+        "justification": justification,
+        "citation": citation,
+        "item_diagnostics": df_diag,
+        "has_ordinal_under_5": has_ordinal_under_5,
+        "has_severe_nonnormality": has_severe_nonnormality,
+        "is_success": True
+    }
+
+
+def compute_mediation_analysis(df, x_col, m_col, y_col, covariates=None, n_boot=1000, seed=42):
+    """
+    PROCESS-style Simple & Covariate-Adjusted Mediation Analysis (Hayes, 2018; Baron & Kenny, 1986).
+    Decomposes total effect (c) into direct effect (c') and indirect effect (ab = a * b).
+    Computes Sobel test, 95% Percentile Bootstrap CI, and Bias-Corrected (BC) Bootstrap CI (B=1000).
+    """
+    if df is None or df.empty:
+        return {"error": "Input dataframe is empty or invalid."}
+    for col, name in [(x_col, "Independent (X)"), (m_col, "Mediator (M)"), (y_col, "Outcome (Y)")]:
+        if not col or col not in df.columns:
+            return {"error": f"{name} variable '{col}' not found in dataframe."}
+
+    covs = [c for c in (covariates or []) if c in df.columns and c not in [x_col, m_col, y_col]]
+    analysis_vars = [x_col, m_col, y_col] + covs
+
+    clean = df[analysis_vars].apply(pd.to_numeric, errors="coerce").dropna().copy()
+    n_obs = len(clean)
+    if n_obs < len(covs) + 15:
+        return {"error": f"Insufficient complete cases ({n_obs}) for mediation analysis."}
+
+    import statsmodels.api as sm
+
+    # 1. Path a: M ~ X + Covariates
+    X_a = sm.add_constant(clean[[x_col] + covs])
+    mod_a = sm.OLS(clean[m_col], X_a).fit()
+    a_coef = float(mod_a.params[x_col])
+    a_se = float(mod_a.bse[x_col])
+    a_t = float(mod_a.tvalues[x_col])
+    a_p = float(mod_a.pvalues[x_col])
+
+    # 2. Path b & Direct Effect c': Y ~ X + M + Covariates
+    X_b = sm.add_constant(clean[[x_col, m_col] + covs])
+    mod_b = sm.OLS(clean[y_col], X_b).fit()
+    b_coef = float(mod_b.params[m_col])
+    b_se = float(mod_b.bse[m_col])
+    b_t = float(mod_b.tvalues[m_col])
+    b_p = float(mod_b.pvalues[m_col])
+
+    c_prime_coef = float(mod_b.params[x_col])
+    c_prime_se = float(mod_b.bse[x_col])
+    c_prime_t = float(mod_b.tvalues[x_col])
+    c_prime_p = float(mod_b.pvalues[x_col])
+
+    # 3. Path c (Total Effect): Y ~ X + Covariates
+    X_c = sm.add_constant(clean[[x_col] + covs])
+    mod_c = sm.OLS(clean[y_col], X_c).fit()
+    c_coef = float(mod_c.params[x_col])
+    c_se = float(mod_c.bse[x_col])
+    c_t = float(mod_c.tvalues[x_col])
+    c_p = float(mod_c.pvalues[x_col])
+
+    # Indirect effect
+    ab_coef = a_coef * b_coef
+
+    # Sobel Test
+    se_sobel = np.sqrt((a_coef ** 2) * (b_se ** 2) + (b_coef ** 2) * (a_se ** 2))
+    z_sobel = ab_coef / np.maximum(se_sobel, 1e-12)
+    p_sobel = 2.0 * (1.0 - stats.norm.cdf(abs(z_sobel)))
+
+    # Non-parametric Bootstrap (B iterations)
+    n_boot = max(200, int(n_boot))
+    np.random.seed(seed)
+    boot_ab = []
+
+    arr_clean = clean[[x_col, m_col, y_col] + covs].values
+    n_rows = len(arr_clean)
+
+    for _ in range(n_boot):
+        idx = np.random.choice(n_rows, size=n_rows, replace=True)
+        sample = arr_clean[idx, :]
+        sx = sample[:, 0]
+        sm_v = sample[:, 1]
+        sy = sample[:, 2]
+        scovs = sample[:, 3:]
+
+        if scovs.shape[1] > 0:
+            X_a_s = np.column_stack([np.ones(n_rows), sx, scovs])
+            X_b_s = np.column_stack([np.ones(n_rows), sx, sm_v, scovs])
+        else:
+            X_a_s = np.column_stack([np.ones(n_rows), sx])
+            X_b_s = np.column_stack([np.ones(n_rows), sx, sm_v])
+
+        try:
+            beta_a = np.linalg.lstsq(X_a_s, sm_v, rcond=None)[0]
+            beta_b = np.linalg.lstsq(X_b_s, sy, rcond=None)[0]
+            boot_ab.append(beta_a[1] * beta_b[2])
+        except Exception:
+            continue
+
+    boot_ab = np.array(boot_ab)
+    actual_boot = len(boot_ab)
+
+    # Percentile Bootstrap 95% CI
+    ci_perc_low = float(np.percentile(boot_ab, 2.5))
+    ci_perc_high = float(np.percentile(boot_ab, 97.5))
+
+    # Bias-Corrected (BC) Bootstrap CI
+    prop_less = np.mean(boot_ab < ab_coef)
+    prop_less = np.clip(prop_less, 1e-5, 1.0 - 1e-5)
+    z0 = stats.norm.ppf(prop_less)
+    z_alpha_low = z0 + (z0 + stats.norm.ppf(0.025))
+    z_alpha_high = z0 + (z0 + stats.norm.ppf(0.975))
+    pct_low = stats.norm.cdf(z_alpha_low) * 100.0
+    pct_high = stats.norm.cdf(z_alpha_high) * 100.0
+    ci_bc_low = float(np.percentile(boot_ab, max(0.0, min(100.0, pct_low))))
+    ci_bc_high = float(np.percentile(boot_ab, max(0.0, min(100.0, pct_high))))
+
+    is_indirect_sig = (ci_bc_low > 0 and ci_bc_high > 0) or (ci_bc_low < 0 and ci_bc_high < 0)
+    is_direct_sig = (c_prime_p < 0.05)
+
+    if is_indirect_sig and not is_direct_sig:
+        mediation_type = "Full (Indirect-Only) Mediation"
+        summary_text = (
+            f"The indirect effect of {x_col} on {y_col} via {m_col} is statistically significant "
+            f"(b = {ab_coef:.4f}, 95% BC CI [{ci_bc_low:.4f}, {ci_bc_high:.4f}]), "
+            f"while the direct effect is non-significant (p = {c_prime_p:.4f}). This establishes Full Mediation."
+        )
+    elif is_indirect_sig and is_direct_sig:
+        if (ab_coef * c_prime_coef) > 0:
+            mediation_type = "Complementary Partial Mediation"
+        else:
+            mediation_type = "Competitive Partial Mediation (Inconsistent Mediation)"
+        summary_text = (
+            f"Both the indirect effect (b = {ab_coef:.4f}, 95% BC CI [{ci_bc_low:.4f}, {ci_bc_high:.4f}]) "
+            f"and direct effect (b = {c_prime_coef:.4f}, p = {c_prime_p:.4f}) are statistically significant. "
+            f"This establishes {mediation_type}."
+        )
+    else:
+        mediation_type = "No Mediation"
+        summary_text = (
+            f"The indirect effect bootstrap confidence interval spans zero "
+            f"(b = {ab_coef:.4f}, 95% BC CI [{ci_bc_low:.4f}, {ci_bc_high:.4f}]). "
+            f"There is no statistically significant mediation."
+        )
+
+    if c_coef != 0 and (ab_coef / c_coef) > 0:
+        pct_mediated = round(float(ab_coef / c_coef) * 100.0, 1)
+    else:
+        pct_mediated = None
+
+    paths_table = pd.DataFrame([
+        {
+            "Path / Component": f"Path a: {x_col} -> {m_col}",
+            "Estimate (B)": round(a_coef, 4),
+            "Std. Error": round(a_se, 4),
+            "t-value": round(a_t, 3),
+            "p-value": round(a_p, 4),
+            "Sig": "***" if a_p < 0.001 else ("**" if a_p < 0.01 else ("*" if a_p < 0.05 else ""))
+        },
+        {
+            "Path / Component": f"Path b: {m_col} -> {y_col}",
+            "Estimate (B)": round(b_coef, 4),
+            "Std. Error": round(b_se, 4),
+            "t-value": round(b_t, 3),
+            "p-value": round(b_p, 4),
+            "Sig": "***" if b_p < 0.001 else ("**" if b_p < 0.01 else ("*" if b_p < 0.05 else ""))
+        },
+        {
+            "Path / Component": f"Direct Effect c': {x_col} -> {y_col}",
+            "Estimate (B)": round(c_prime_coef, 4),
+            "Std. Error": round(c_prime_se, 4),
+            "t-value": round(c_prime_t, 3),
+            "p-value": round(c_prime_p, 4),
+            "Sig": "***" if c_prime_p < 0.001 else ("**" if c_prime_p < 0.01 else ("*" if c_prime_p < 0.05 else ""))
+        },
+        {
+            "Path / Component": f"Total Effect c: {x_col} -> {y_col}",
+            "Estimate (B)": round(c_coef, 4),
+            "Std. Error": round(c_se, 4),
+            "t-value": round(c_t, 3),
+            "p-value": round(c_p, 4),
+            "Sig": "***" if c_p < 0.001 else ("**" if c_p < 0.01 else ("*" if c_p < 0.05 else ""))
+        }
+    ])
+
+    effects_table = pd.DataFrame([
+        {
+            "Effect": "Indirect Effect (ab)",
+            "Estimate": round(ab_coef, 4),
+            "Sobel SE": round(se_sobel, 4),
+            "Sobel z": round(z_sobel, 3),
+            "Sobel p": round(p_sobel, 4),
+            "95% Percentile Boot CI": f"[{ci_perc_low:.4f}, {ci_perc_high:.4f}]",
+            "95% Bias-Corrected Boot CI": f"[{ci_bc_low:.4f}, {ci_bc_high:.4f}]",
+            "Conclusion": "Significant" if is_indirect_sig else "Not Significant"
+        }
+    ])
+
+    return {
+        "paths_table": paths_table,
+        "effects_table": effects_table,
+        "indirect_ab": round(ab_coef, 4),
+        "direct_c_prime": round(c_prime_coef, 4),
+        "total_c": round(c_coef, 4),
+        "ci_perc": (ci_perc_low, ci_perc_high),
+        "ci_bc": (ci_bc_low, ci_bc_high),
+        "sobel_p": p_sobel,
+        "mediation_type": mediation_type,
+        "summary_text": summary_text,
+        "pct_mediated": pct_mediated,
+        "n_obs": n_obs,
+        "n_boot": actual_boot,
+        "is_success": True
+    }
+
+
+def compute_moderation_analysis(df, x_col, w_col, y_col, covariates=None):
+    """
+    Hierarchical Moderation Analysis with Mean-Centering and Simple Slopes (Aiken & West, 1991).
+    Tests interaction term (X * W), reports incremental delta R^2 and F-change,
+    and estimates conditional simple slopes at -1 SD (Low), Mean (Average), and +1 SD (High).
+    """
+    if df is None or df.empty:
+        return {"error": "Input dataframe is empty or invalid."}
+    for col, name in [(x_col, "Focal Predictor (X)"), (w_col, "Moderator (W)"), (y_col, "Outcome (Y)")]:
+        if not col or col not in df.columns:
+            return {"error": f"{name} variable '{col}' not found in dataframe."}
+
+    covs = [c for c in (covariates or []) if c in df.columns and c not in [x_col, w_col, y_col]]
+    all_vars = [x_col, w_col, y_col] + covs
+
+    clean = df[all_vars].apply(pd.to_numeric, errors="coerce").dropna().copy()
+    n_obs = len(clean)
+    if n_obs < len(covs) + 10:
+        return {"error": f"Insufficient complete cases ({n_obs}) for moderation analysis."}
+
+    import statsmodels.api as sm
+
+    # 1. Mean-center X and W
+    x_mean = float(clean[x_col].mean())
+    w_mean = float(clean[w_col].mean())
+    w_sd = float(clean[w_col].std(ddof=1))
+    x_sd = float(clean[x_col].std(ddof=1))
+
+    clean["_x_cent_"] = clean[x_col] - x_mean
+    clean["_w_cent_"] = clean[w_col] - w_mean
+    clean["_xw_interact_"] = clean["_x_cent_"] * clean["_w_cent_"]
+
+    # 2. Model 1: Main Effects (Y ~ X_c + W_c + Covariates)
+    X_m1 = sm.add_constant(clean[["_x_cent_", "_w_cent_"] + covs])
+    mod_1 = sm.OLS(clean[y_col], X_m1).fit()
+
+    # 3. Model 2: Interaction Model (Y ~ X_c + W_c + XW + Covariates)
+    X_m2 = sm.add_constant(clean[["_x_cent_", "_w_cent_", "_xw_interact_"] + covs])
+    mod_2 = sm.OLS(clean[y_col], X_m2).fit()
+
+    # 4. Incremental F-test (Delta R^2)
+    r2_1 = float(mod_1.rsquared)
+    r2_2 = float(mod_2.rsquared)
+    delta_r2 = max(0.0, r2_2 - r2_1)
+    df_resid_2 = int(mod_2.df_resid)
+
+    f_change = (delta_r2 / 1.0) / ((1.0 - r2_2) / max(1, df_resid_2))
+    p_change = float(1.0 - stats.f.cdf(f_change, 1, df_resid_2))
+
+    param_map = {
+        "const": "Intercept (Constant)",
+        "_x_cent_": f"{x_col} (Mean-Centered)",
+        "_w_cent_": f"{w_col} (Mean-Centered)",
+        "_xw_interact_": f"Interaction: {x_col} × {w_col}"
+    }
+    for c in covs:
+        param_map[c] = f"Covariate: {c}"
+
+    mod2_rows = []
+    for p_name in mod_2.params.index:
+        b = float(mod_2.params[p_name])
+        se = float(mod_2.bse[p_name])
+        t = float(mod_2.tvalues[p_name])
+        p = float(mod_2.pvalues[p_name])
+        ci_l = float(mod_2.conf_int().loc[p_name, 0])
+        ci_u = float(mod_2.conf_int().loc[p_name, 1])
+        star = "***" if p < 0.001 else ("**" if p < 0.01 else ("*" if p < 0.05 else ""))
+
+        mod2_rows.append({
+            "Predictor": param_map.get(p_name, p_name),
+            "Coefficient (B)": round(b, 4),
+            "Std. Error": round(se, 4),
+            "t-value": round(t, 3),
+            "p-value": round(p, 4),
+            "Sig": star,
+            "95% CI Lower": round(ci_l, 4),
+            "95% CI Upper": round(ci_u, 4)
+        })
+    df_mod2 = pd.DataFrame(mod2_rows)
+
+    # 5. Simple Slopes Analysis (Aiken & West, 1991)
+    b1 = float(mod_2.params["_x_cent_"])
+    b3 = float(mod_2.params["_xw_interact_"])
+    cov_mat = mod_2.cov_params()
+    var_b1 = float(cov_mat.loc["_x_cent_", "_x_cent_"])
+    var_b3 = float(cov_mat.loc["_xw_interact_", "_xw_interact_"])
+    cov_b1_b3 = float(cov_mat.loc["_x_cent_", "_xw_interact_"])
+
+    levels = [
+        ("Low Moderator (-1 SD)", -w_sd, round(w_mean - w_sd, 3)),
+        ("Average Moderator (Mean)", 0.0, round(w_mean, 3)),
+        ("High Moderator (+1 SD)", +w_sd, round(w_mean + w_sd, 3))
+    ]
+
+    slopes_records = []
+    plot_data = {"x_vals": [-x_sd, x_sd], "lines": {}}
+
+    for label, w_val_cent, w_actual in levels:
+        slope = b1 + b3 * w_val_cent
+        var_slope = var_b1 + (w_val_cent ** 2) * var_b3 + 2.0 * w_val_cent * cov_b1_b3
+        se_slope = np.sqrt(max(var_slope, 1e-12))
+        t_slope = slope / se_slope
+        p_slope = float(2.0 * (1.0 - stats.t.cdf(abs(t_slope), df=df_resid_2)))
+        t_crit = stats.t.ppf(0.975, df=df_resid_2)
+        ci_l = slope - t_crit * se_slope
+        ci_u = slope + t_crit * se_slope
+        star = "***" if p_slope < 0.001 else ("**" if p_slope < 0.01 else ("*" if p_slope < 0.05 else ""))
+
+        slopes_records.append({
+            "Moderator Level": label,
+            f"{w_col} Value": w_actual,
+            "Simple Slope (B)": round(slope, 4),
+            "Std. Error": round(se_slope, 4),
+            "t-value": round(t_slope, 3),
+            "p-value": round(p_slope, 4),
+            "Sig": star,
+            "95% CI Lower": round(ci_l, 4),
+            "95% CI Upper": round(ci_u, 4)
+        })
+
+        b0 = float(mod_2.params["const"])
+        b2 = float(mod_2.params["_w_cent_"])
+        y_low_x = b0 + b2 * w_val_cent + slope * (-x_sd)
+        y_high_x = b0 + b2 * w_val_cent + slope * (+x_sd)
+        plot_data["lines"][label] = [round(float(y_low_x), 3), round(float(y_high_x), 3)]
+
+    df_slopes = pd.DataFrame(slopes_records)
+
+    is_moderation_sig = (p_change < 0.05)
+    conclusion = (
+        f"The interaction term between {x_col} and {w_col} is statistically significant "
+        f"(ΔR² = {delta_r2:.4f}, F(1, {df_resid_2}) = {f_change:.2f}, p = {p_change:.4f}). "
+        f"This confirms that {w_col} significantly moderates the effect of {x_col} on {y_col}."
+        if is_moderation_sig else
+        f"The interaction term is not statistically significant "
+        f"(ΔR² = {delta_r2:.4f}, F(1, {df_resid_2}) = {f_change:.2f}, p = {p_change:.4f}). "
+        f"There is no evidence that {w_col} moderates the relationship."
+    )
+
+    return {
+        "model_table": df_mod2,
+        "simple_slopes_table": df_slopes,
+        "r2_model1": round(r2_1, 4),
+        "r2_model2": round(r2_2, 4),
+        "delta_r2": round(delta_r2, 4),
+        "f_change": round(f_change, 3),
+        "p_change": round(p_change, 4),
+        "df_resid": df_resid_2,
+        "is_moderation_sig": is_moderation_sig,
+        "conclusion": conclusion,
+        "plot_data": plot_data,
+        "n_obs": n_obs,
+        "is_success": True
+    }
 
 
 
