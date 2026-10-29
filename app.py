@@ -20,7 +20,7 @@ import streamlit as st
 
 import engine
 
-WORKSPACE = Path(r"c:\Users\nanak\Desktop\mawuse assignment")
+WORKSPACE = Path(__file__).parent.resolve()
 DEFAULT_EXCEL = WORKSPACE / "Masterfile_2_English.xlsx"
 ASSETS_DIR = WORKSPACE / "assets"
 LOGO_ICON = ASSETS_DIR / "logo_icon.jpg"
@@ -137,13 +137,18 @@ else:
 st.sidebar.markdown("### Dycson Cleaning Studio")
 st.sidebar.caption("Universal Spreadsheet, Survey Intelligence & Statistical Platform")
 
+NAV_MODES = [
+    "🎯 KFL & CPE Survey Forensic Cleaning Studio",
+    "🔍 Universal Messy Excel & Survey Cleaner",
+    "📖 User Guide & Documentation",
+]
+if "app_mode_nav" not in st.session_state:
+    st.session_state["app_mode_nav"] = NAV_MODES[0]
+
 app_mode = st.sidebar.radio(
     "Navigate Studio:",
-    [
-        "🎯 KFL & CPE Survey Forensic Cleaning Studio",
-        "🔍 Universal Messy Excel & Survey Cleaner",
-        "📖 User Guide & Documentation",
-    ],
+    NAV_MODES,
+    key="app_mode_nav",
 )
 
 st.sidebar.divider()
@@ -208,6 +213,7 @@ if app_mode.startswith("🎯"):
         )
 
     df_raw = None
+    uploaded_kfl = None
     if "Upload" in data_source:
         uploaded_kfl = st.file_uploader(
             "Upload Survey Excel File (.xlsx, .xls):",
@@ -216,7 +222,13 @@ if app_mode.startswith("🎯"):
         )
         if uploaded_kfl is not None:
             with st.spinner("Reading uploaded workbook..."):
-                df_raw = pd.read_excel(uploaded_kfl)
+                try:
+                    df_raw = pd.read_excel(uploaded_kfl)
+                except Exception as e:
+                    st.error(f"❌ Failed to parse uploaded Excel file: {e}")
+                    render_footer()
+                    render_sidebar_footer()
+                    st.stop()
         else:
             st.info("👆 Drag and drop or browse to upload your survey spreadsheet above to begin forensic reconstruction.")
             render_footer()
@@ -226,8 +238,30 @@ if app_mode.startswith("🎯"):
         with st.spinner("Loading preloaded benchmark survey dataset..."):
             df_raw = load_cached_excel(str(DEFAULT_EXCEL))
 
-    with st.spinner("Running forensic reconstruction and psychometric engine..."):
-        res = cached_kfl_pipeline(df_raw, imp_strategy)
+    try:
+        with st.spinner("Running forensic reconstruction and psychometric engine..."):
+            res = cached_kfl_pipeline(df_raw, imp_strategy)
+    except (engine.KFLSchemaMismatchError, KeyError, IndexError, ValueError) as err:
+        st.warning(
+            f"⚠️ **Dataset Schema Notice**: {str(err)}\n\n"
+            "This preset pipeline is designed specifically for the **9-block Swedish raw survey Masterfile benchmark** "
+            "(containing cohorts B0–B8 and raw survey items like `bakgrund20`, `var0400`, `Tegelsten`).\n\n"
+            "If you are uploading an arbitrary survey, questionnaire, or general tabular spreadsheet, "
+            "please use the **Universal Messy Excel & Survey Cleaner**."
+        )
+        col_act1, col_act2 = st.columns(2)
+        with col_act1:
+            if uploaded_kfl is not None and st.button("🚀 Open this file in Universal Cleaner & Statistical Studio", type="primary"):
+                st.session_state["passed_uploaded_file"] = uploaded_kfl
+                st.session_state["app_mode_nav"] = NAV_MODES[1]
+                st.rerun()
+        with col_act2:
+            if has_benchmark and st.button("📊 Switch back to Preloaded Benchmark Dataset"):
+                st.session_state["kfl_data_source"] = "📊 Use Preloaded Benchmark Dataset (342-Manager Validated Cohort)"
+                st.rerun()
+        render_footer()
+        render_sidebar_footer()
+        st.stop()
 
     df_t342 = res["df_thesis_raw"]
     df_t342_imp = res["df_thesis_imp"]
@@ -643,7 +677,15 @@ elif app_mode.startswith("🔍"):
         unsafe_allow_html=True,
     )
 
+    passed_file = st.session_state.get("passed_uploaded_file", None)
     uploaded_general = st.file_uploader("Upload Any Excel or CSV File (.xlsx, .xls, .csv):", type=["xlsx", "xls", "csv"])
+
+    if uploaded_general is not None:
+        if "passed_uploaded_file" in st.session_state:
+            st.session_state.pop("passed_uploaded_file", None)
+    elif passed_file is not None:
+        uploaded_general = passed_file
+        st.info(f"📂 Currently analyzing file forwarded from Preset Studio: **{passed_file.name}**")
 
     if uploaded_general is None:
         st.info("👆 Upload any survey or messy data file above to begin.")

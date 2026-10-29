@@ -1204,6 +1204,11 @@ if __name__ == "__main__":
 # 7. KFL & CPE Thesis Survey Preset Pipeline
 # ---------------------------------------------------------------------------
 
+class KFLSchemaMismatchError(Exception):
+    """Raised when an input DataFrame does not match the 9-block survey benchmark schema."""
+    pass
+
+
 def build_b3_b4_bijection(df):
     match_pairs = [
         ("bakgrund20", "var0400"), ("bakgrund21", "bakgrund20"), ("var0402", "var0401"),
@@ -1216,6 +1221,19 @@ def build_b3_b4_bijection(df):
         ("KFL22", "KFL15"), ("KFL25", "KFL16"), ("KFL26", "KFL17"),
         ("KFL27", "KFL18"), ("KFL28", "KFL19"), ("KFL29", "KFL20"),
     ]
+    if df is None or not isinstance(df, pd.DataFrame):
+        raise KFLSchemaMismatchError("Uploaded file is not a valid DataFrame.")
+    if len(df) < 473:
+        raise KFLSchemaMismatchError(
+            f"Uploaded spreadsheet has {len(df)} rows. The 9-block benchmark cohort requires at least 473 rows "
+            f"to reconstruct the B3 and B4 respondent cohorts."
+        )
+    missing_cols = [p[0] for p in match_pairs if p[0] not in df.columns] + [p[1] for p in match_pairs if p[1] not in df.columns]
+    if missing_cols:
+        unique_missing = list(dict.fromkeys(missing_cols))
+        raise KFLSchemaMismatchError(
+            f"Uploaded workbook is missing required benchmark columns: {unique_missing[:5]}."
+        )
     b3_cols = [df.columns.get_loc(p[0]) for p in match_pairs]
     b4_cols = [df.columns.get_loc(p[1]) for p in match_pairs]
 

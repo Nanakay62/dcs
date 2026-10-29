@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-WORKSPACE = Path(r"c:\Users\nanak\Desktop\mawuse assignment")
+WORKSPACE = Path(__file__).parent.resolve()
 INPUT_EXCEL = WORKSPACE / "Masterfile_2_English.xlsx"
 
 # ---------------------------------------------------------------------------
@@ -153,6 +153,9 @@ def build_b3_b4_bijection(df):
         ("KFL28", "KFL19"),
         ("KFL29", "KFL20"),
     ]
+    missing_cols = [p[0] for p in match_pairs if p[0] not in df.columns] + [p[1] for p in match_pairs if p[1] not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required benchmark columns: {missing_cols[:5]}")
     b3_cols = [df.columns.get_loc(p[0]) for p in match_pairs]
     b4_cols = [df.columns.get_loc(p[1]) for p in match_pairs]
 
