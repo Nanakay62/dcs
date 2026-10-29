@@ -181,6 +181,8 @@ def clean_text_hygiene(val):
     """Strip leading/trailing whitespace, non-breaking spaces (\xa0), line breaks, and excessive internal spaces."""
     if pd.isna(val):
         return np.nan
+    if isinstance(val, (int, float, np.integer, np.floating)) and not isinstance(val, bool):
+        return val
     s = str(val).replace('\xa0', ' ').replace('\r', ' ').replace('\n', ' ')
     s = re.sub(r'\s+', ' ', s).strip()
     return s if s else np.nan
@@ -308,6 +310,24 @@ def make_columns_unique(cols):
     return unique
 
 
+def get_numeric_columns(df):
+    """
+    Returns list of columns in df that are numeric or can be reliably coerced to numeric.
+    """
+    numeric_cols = []
+    for c in df.columns:
+        col = df[c]
+        if isinstance(col, pd.Series):
+            if pd.api.types.is_numeric_dtype(col):
+                numeric_cols.append(c)
+            else:
+                s_num = pd.to_numeric(col, errors='coerce')
+                val_count = int(col.dropna().shape[0])
+                if val_count >= 2 and (int(s_num.notna().sum()) / val_count >= 0.7):
+                    numeric_cols.append(c)
+    return numeric_cols
+
+
 # ---------------------------------------------------------------------------
 # 3. Structural & Layout Reconstruction (Category A)
 # ---------------------------------------------------------------------------
@@ -367,7 +387,7 @@ def detect_and_strip_stacked_tables(df_raw):
     Strips repeated headers and adds a `source_section` column tagging each row.
     """
     d = df_raw.copy()
-    col_names = [clean_text_hygiene(c).lower() for c in d.columns if pd.notna(c)]
+    col_names = [str(clean_text_hygiene(c)).lower() for c in d.columns if pd.notna(c)]
     
     sections = []
     current_section = "Main"
@@ -410,7 +430,7 @@ def strip_summary_rows(df_raw):
     rows_to_drop = []
 
     for idx in d.index:
-        first_few = [clean_text_hygiene(d.iloc[idx, c]).lower() for c in range(min(5, d.shape[1])) if pd.notna(d.iloc[idx, c])]
+        first_few = [str(clean_text_hygiene(d.iloc[idx, c])).lower() for c in range(min(5, d.shape[1])) if pd.notna(d.iloc[idx, c])]
         for text in first_few:
             if any(k in text for k in SUMMARY_KEYWORDS):
                 rows_to_drop.append(idx)
@@ -616,21 +636,37 @@ def clean_general_dataframe(df_raw,
     if map_likert:
         for c in d.columns:
             col_series = d[c]
-            if isinstance(col_series, pd.Series):
+            if isinstance(col_series, pd.Series) and not pd.api.types.is_numeric_dtype(col_series):
                 s_low = col_series.dropna().astype(str).str.strip().str.lower()
                 if len(s_low) > 0 and (s_low.isin(LIKERT_TEXT_MAP.keys()).sum() >= 2):
-                    d[c] = col_series.apply(parse_numeric_cell)
+                    d[c] = pd.to_numeric(col_series.apply(parse_numeric_cell), errors='coerce')
 
     # 8. Smart currency, percentage & number parsing
     if parse_numbers:
         for c in d.columns:
             col_series = d[c]
-            if isinstance(col_series, pd.Series) and col_series.dtype == object and not pd.api.types.is_numeric_dtype(col_series):
-                s_non_null = col_series.dropna()
-                if len(s_non_null) >= 3:
-                    parsed = s_non_null.apply(parse_numeric_cell)
-                    if parsed.notna().sum() >= (len(s_non_null) * 0.7):
-                        d[c] = col_series.apply(parse_numeric_cell)
+            if isinstance(col_series, pd.Series) and not pd.api.types.is_numeric_dtype(col_series):
+                val_count = int(col_series.dropna().shape[0])
+                if val_count > 0:
+                    s_num = pd.to_numeric(col_series, errors='coerce')
+                    n_valid_num = int(s_num.notna().sum())
+                    if n_valid_num >= 2 and (n_valid_num / val_count >= 0.7):
+                        d[c] = s_num
+                    else:
+                        s_parsed = pd.to_numeric(col_series.apply(parse_numeric_cell), errors='coerce')
+                        n_valid_parsed = int(s_parsed.notna().sum())
+                        if n_valid_parsed >= 2 and (n_valid_parsed / val_count >= 0.7):
+                            d[c] = s_parsed
+
+    # Auto-convert purely numeric object columns to proper numeric dtypes
+    for c in d.columns:
+        col_series = d[c]
+        if isinstance(col_series, pd.Series) and not pd.api.types.is_numeric_dtype(col_series):
+            try:
+                s_num = pd.to_numeric(col_series, errors='raise')
+                d[c] = s_num
+            except (ValueError, TypeError):
+                pass
 
     # 9. Deduplication
     if drop_duplicates:

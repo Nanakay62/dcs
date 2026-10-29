@@ -813,6 +813,7 @@ elif app_mode.startswith("🔍"):
         unique_headers = engine.make_columns_unique(raw_headers)
         df_working = df_raw_sheet.iloc[header_row_choice + 1:].copy().reset_index(drop=True)
         df_working.columns = unique_headers
+    df_working = df_working.infer_objects()
 
     # X-Ray Diagnostic Report
     xray = engine.xray_inspect_spreadsheet(df_working)
@@ -896,9 +897,14 @@ elif app_mode.startswith("🔍"):
 
     # Session state persistence for interactive transformations
     session_file_key = f"active_df_{uploaded_general.name}"
-    if session_file_key not in st.session_state or st.session_state.get("current_file") != uploaded_general.name:
+    curr_opts_key = f"opts_{uploaded_general.name}"
+    last_opts = st.session_state.get(curr_opts_key, None)
+    if (session_file_key not in st.session_state
+        or st.session_state.get("current_file") != uploaded_general.name
+        or last_opts != cleaning_options):
         st.session_state[session_file_key] = df_base_cleaned.copy()
         st.session_state["current_file"] = uploaded_general.name
+        st.session_state[curr_opts_key] = cleaning_options.copy()
 
     df_cleaned = st.session_state[session_file_key]
 
@@ -916,6 +922,25 @@ elif app_mode.startswith("🔍"):
 
     with gt1:
         st.subheader("Cleaned Dataset Inspection")
+
+        c_prev1, c_prev2 = st.columns([1.6, 2.4])
+        with c_prev1:
+            buf_prev_xlsx = io.BytesIO()
+            with pd.ExcelWriter(buf_prev_xlsx, engine="openpyxl") as writer:
+                df_cleaned.to_excel(writer, sheet_name="Cleaned_Data", index=False)
+                engine.generate_data_dictionary(df_cleaned).to_excel(writer, sheet_name="Data_Dictionary", index=False)
+            base_fname = uploaded_general.name.rsplit(".", 1)[0]
+            st.download_button(
+                label="📥 Download Cleaned Dataset as Excel (.xlsx)",
+                data=buf_prev_xlsx.getvalue(),
+                file_name=f"Cleaned_{base_fname}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+        with c_prev2:
+            st.caption(f"📊 Download verified Excel workbook with `{df_cleaned.shape[0]} rows × {df_cleaned.shape[1]} columns` + Codebook sheet.")
+
+        st.write("")
         q_search = st.text_input("Filter rows by keyword:", "")
         if q_search:
             m = df_cleaned.astype(str).apply(lambda row: row.str.contains(q_search, case=False, na=False).any(), axis=1)
@@ -964,7 +989,7 @@ elif app_mode.startswith("🔍"):
         st.subheader("Survey Quality: Careless Response (Straightliner) & Outlier Detection")
         st.write("Identifies respondents who entered zero variance across survey questions or have extreme outlier scores (|z| > 3):")
 
-        num_cols = [c for c in df_cleaned.columns if pd.api.types.is_numeric_dtype(df_cleaned[c])]
+        num_cols = engine.get_numeric_columns(df_cleaned)
         if len(num_cols) >= 3:
             qc_cols = st.multiselect("Select question items to evaluate response variance:", options=num_cols, default=num_cols[:min(10, len(num_cols))])
             if len(qc_cols) >= 3:
@@ -994,7 +1019,7 @@ elif app_mode.startswith("🔍"):
     with gt3:
         st.subheader("Scale Reliability, Reverse-Coding & Item-Rest Analysis")
         
-        num_cols = [c for c in df_cleaned.columns if pd.api.types.is_numeric_dtype(df_cleaned[c])]
+        num_cols = engine.get_numeric_columns(df_cleaned)
         if len(num_cols) >= 2:
             r1, r2 = st.columns([1, 2])
             with r1:
@@ -1010,7 +1035,7 @@ elif app_mode.startswith("🔍"):
 
             with r2:
                 st.write("##### Cronbach's Alpha (α) with 'Alpha if Item Deleted'")
-                num_cols_avail = [c for c in df_cleaned.columns if pd.api.types.is_numeric_dtype(df_cleaned[c])]
+                num_cols_avail = engine.get_numeric_columns(df_cleaned)
                 scale_items = st.multiselect("Select items forming the scale:", options=num_cols_avail, default=num_cols_avail[:min(6, len(num_cols_avail))])
 
                 if len(scale_items) >= 2:
@@ -1031,7 +1056,7 @@ elif app_mode.startswith("🔍"):
         st.subheader("🔬 Statistical Data Analysis")
         st.write("Live bivariate correlations, multiple linear regression, and principal component factor analysis:")
 
-        num_cols_analysis = [c for c in df_cleaned.columns if pd.api.types.is_numeric_dtype(df_cleaned[c])]
+        num_cols_analysis = engine.get_numeric_columns(df_cleaned)
         if len(num_cols_analysis) >= 2:
             stat_submode = st.radio("Choose Analysis Tool:", ["Correlation Matrix", "Multiple Linear Regression", "Principal Component Loadings"], horizontal=True)
 
