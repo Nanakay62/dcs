@@ -282,6 +282,32 @@ def clean_numeric_val(val, min_val=None, max_val=None):
     return v
 
 
+def make_columns_unique(cols):
+    """
+    Ensures all column names in a list or index are unique, string-based, and non-empty.
+    Appends _2, _3, etc. for duplicates without colliding with existing names.
+    Example: ['Q1', 'Q1', '', None] -> ['Q1', 'Q1_2', 'Column_3', 'Column_4']
+    """
+    used = set()
+    unique = []
+    for i, c in enumerate(cols):
+        if pd.isna(c) or c is None:
+            base = f"Column_{i+1}"
+        else:
+            cleaned = str(c).strip()
+            base = cleaned if cleaned else f"Column_{i+1}"
+
+        cand = base
+        count = 2
+        while cand in used:
+            cand = f"{base}_{count}"
+            count += 1
+
+        used.add(cand)
+        unique.append(cand)
+    return unique
+
+
 # ---------------------------------------------------------------------------
 # 3. Structural & Layout Reconstruction (Category A)
 # ---------------------------------------------------------------------------
@@ -331,7 +357,7 @@ def merge_multi_headers(df_raw, header_indices=[0, 1]):
         cols.append(col_name)
 
     data = df_raw.iloc[max(header_indices) + 1:].copy().reset_index(drop=True)
-    data.columns = cols
+    data.columns = make_columns_unique(cols)
     return data
 
 
@@ -405,13 +431,15 @@ def consolidate_multisheet_excel(excel_file_or_bytes, sheet_names=None):
     dfs = []
 
     for name in targets:
-        sub_df = xl.parse(name)
+        sub_df = pd.read_excel(excel_file_or_bytes, sheet_name=name)
         sub_df["source_sheet"] = name
         dfs.append(sub_df)
 
     if not dfs:
         return pd.DataFrame()
-    return pd.concat(dfs, ignore_index=True)
+    res = pd.concat(dfs, ignore_index=True)
+    res.columns = make_columns_unique(res.columns)
+    return res
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +564,7 @@ def clean_general_dataframe(df_raw,
     Full automated pipeline applying chosen upgrades to any dataset.
     """
     d = df_raw.copy()
+    d.columns = make_columns_unique(d.columns)
 
     # 1. Drop completely empty rows
     if drop_blanks:
@@ -545,6 +574,7 @@ def clean_general_dataframe(df_raw,
     # 2. Strip single-cell banners or handle stacked tables
     if strip_stacked:
         d = detect_and_strip_stacked_tables(d)
+        d.columns = make_columns_unique(d.columns)
     elif drop_banners:
         rows_to_drop = []
         for idx in d.index:
@@ -561,40 +591,46 @@ def clean_general_dataframe(df_raw,
     # 4. Clean disguised missing sentinels ('N/A', '-', '999')
     if clean_sentinels:
         for c in d.columns:
-            if d[c].dtype == object or pd.api.types.is_string_dtype(d[c]):
-                mask = d[c].astype(str).str.strip().str.lower().isin(SENTINEL_VALUES)
+            col_series = d[c]
+            if isinstance(col_series, pd.Series) and (col_series.dtype == object or pd.api.types.is_string_dtype(col_series)):
+                mask = col_series.astype(str).str.strip().str.lower().isin(SENTINEL_VALUES)
                 d.loc[mask, c] = np.nan
 
     # 5. String hygiene
     if trim_strings:
         for c in d.columns:
-            if d[c].dtype == object or pd.api.types.is_string_dtype(d[c]):
-                d[c] = d[c].apply(clean_text_hygiene)
+            col_series = d[c]
+            if isinstance(col_series, pd.Series) and (col_series.dtype == object or pd.api.types.is_string_dtype(col_series)):
+                d[c] = col_series.apply(clean_text_hygiene)
 
     # 6. Repair Excel date corruptions ('2025-01-09' -> '1-9')
     if repair_dates:
         for c in d.columns:
-            has_dt = any(isinstance(v, (datetime.datetime, datetime.date, pd.Timestamp)) for v in d[c].dropna())
-            if has_dt:
-                d[c] = d[c].apply(fix_excel_date_range)
+            col_series = d[c]
+            if isinstance(col_series, pd.Series):
+                has_dt = any(isinstance(v, (datetime.datetime, datetime.date, pd.Timestamp)) for v in col_series.dropna())
+                if has_dt:
+                    d[c] = col_series.apply(fix_excel_date_range)
 
     # 7. Map Likert text labels to numeric
     if map_likert:
         for c in d.columns:
-            s_low = d[c].dropna().astype(str).str.strip().str.lower()
-            if len(s_low) > 0 and (s_low.isin(LIKERT_TEXT_MAP.keys()).sum() >= 2):
-                d[c] = d[c].apply(parse_numeric_cell)
+            col_series = d[c]
+            if isinstance(col_series, pd.Series):
+                s_low = col_series.dropna().astype(str).str.strip().str.lower()
+                if len(s_low) > 0 and (s_low.isin(LIKERT_TEXT_MAP.keys()).sum() >= 2):
+                    d[c] = col_series.apply(parse_numeric_cell)
 
     # 8. Smart currency, percentage & number parsing
     if parse_numbers:
         for c in d.columns:
-            if d[c].dtype == object and not pd.api.types.is_numeric_dtype(d[c]):
-                # Test numeric conversion on sample
-                s_non_null = d[c].dropna()
+            col_series = d[c]
+            if isinstance(col_series, pd.Series) and col_series.dtype == object and not pd.api.types.is_numeric_dtype(col_series):
+                s_non_null = col_series.dropna()
                 if len(s_non_null) >= 3:
                     parsed = s_non_null.apply(parse_numeric_cell)
                     if parsed.notna().sum() >= (len(s_non_null) * 0.7):
-                        d[c] = d[c].apply(parse_numeric_cell)
+                        d[c] = col_series.apply(parse_numeric_cell)
 
     # 9. Deduplication
     if drop_duplicates:
@@ -603,10 +639,11 @@ def clean_general_dataframe(df_raw,
     # 10. Missing value imputation
     if imputation in ("median", "mean"):
         for c in d.columns:
-            if pd.api.types.is_numeric_dtype(d[c]):
-                fill_val = d[c].median() if imputation == "median" else d[c].mean()
+            col_series = d[c]
+            if isinstance(col_series, pd.Series) and pd.api.types.is_numeric_dtype(col_series):
+                fill_val = col_series.median() if imputation == "median" else col_series.mean()
                 if pd.notna(fill_val):
-                    d[c] = d[c].fillna(fill_val)
+                    d[c] = col_series.fillna(fill_val)
 
     return d
 
@@ -1109,13 +1146,16 @@ def generate_non_response_audit_report(df):
     Reports exact valid responses out of total (e.g. '5 valid responses out of 10'),
     percentage response rate, and missing count.
     """
-    total_rows = len(df)
-    total_cols = len(df.columns)
+    df_copy = df.copy()
+    df_copy.columns = make_columns_unique(df_copy.columns)
+    total_rows = len(df_copy)
+    total_cols = len(df_copy.columns)
 
     # 1. Item-Level Audit
     item_rows = []
-    for col in df.columns:
-        s = df[col]
+    for c_idx in range(total_cols):
+        col = df_copy.columns[c_idx]
+        s = df_copy.iloc[:, c_idx]
         n_valid = int(s.notna().sum())
         n_missing = int(s.isna().sum())
         resp_rate = round(100.0 * n_valid / max(total_rows, 1), 1)
@@ -1133,7 +1173,7 @@ def generate_non_response_audit_report(df):
             status = f"🟠 Low Response ({resp_rate}%)"
 
         item_rows.append({
-            "Variable / Question": col,
+            "Variable / Question": str(col),
             "Valid Responses": n_valid,
             "Not Reported / Missing": n_missing,
             "Total Surveyed": total_rows,
@@ -1147,7 +1187,7 @@ def generate_non_response_audit_report(df):
     # 2. Case-Level (Respondent) Audit
     case_rows = []
     for idx in range(total_rows):
-        row = df.iloc[idx]
+        row = df_copy.iloc[idx]
         n_answered = int(row.notna().sum())
         n_unanswered = int(row.isna().sum())
         case_rate = round(100.0 * n_answered / max(total_cols, 1), 1)
@@ -1162,10 +1202,14 @@ def generate_non_response_audit_report(df):
             pattern = f"🟡 Partial Non-Response ({case_rate}%)"
 
         resp_label = f"Respondent #{idx + 1}"
-        for id_candidate in ["respondent_id", "Respondent_ID", "ID", "id", "Subject", "subject"]:
-            if id_candidate in df.columns and pd.notna(row[id_candidate]):
-                resp_label = str(row[id_candidate])
-                break
+        for id_candidate in ["thesis_id", "respondent_id", "Respondent_ID", "ID", "id", "Subject", "subject"]:
+            if id_candidate in df_copy.columns:
+                val = row[id_candidate]
+                if isinstance(val, pd.Series):
+                    val = val.iloc[0]
+                if pd.notna(val) and str(val).strip():
+                    resp_label = str(val).strip()
+                    break
 
         case_rows.append({
             "Respondent": resp_label,
@@ -1180,13 +1224,13 @@ def generate_non_response_audit_report(df):
 
     # 3. Overall Matrix Summary
     total_cells = total_rows * total_cols
-    total_valid_cells = int(df.notna().sum().sum())
+    total_valid_cells = int(df_copy.notna().values.sum()) if total_cells > 0 else 0
     total_missing_cells = total_cells - total_valid_cells
     overall_response_rate = round(100.0 * total_valid_cells / max(total_cells, 1), 1)
 
-    complete_respondents = int((df.isna().sum(axis=1) == 0).sum())
-    partial_respondents = int(((df.isna().sum(axis=1) > 0) & (df.notna().sum(axis=1) > 0)).sum())
-    dropout_respondents = int((df.notna().sum(axis=1) == 0).sum())
+    complete_respondents = int((df_copy.isna().sum(axis=1) == 0).sum()) if total_rows > 0 else 0
+    partial_respondents = int(((df_copy.isna().sum(axis=1) > 0) & (df_copy.notna().sum(axis=1) > 0)).sum()) if total_rows > 0 else 0
+    dropout_respondents = int((df_copy.notna().sum(axis=1) == 0).sum()) if total_rows > 0 else 0
 
     overview = {
         "total_respondents": total_rows,
@@ -1209,33 +1253,49 @@ def generate_non_response_audit_report(df):
 
 def generate_data_dictionary(df):
     """Generates comprehensive variable dictionary with summary metrics for every column."""
+    df_copy = df.copy()
+    df_copy.columns = make_columns_unique(df_copy.columns)
     rows = []
-    for col in df.columns:
-        s = df[col]
+    for c_idx in range(df_copy.shape[1]):
+        col = df_copy.columns[c_idx]
+        s = df_copy.iloc[:, c_idx]
         n_valid = int(s.notna().sum())
         n_missing = int(s.isna().sum())
-        pct_valid = round(100.0 * n_valid / max(len(df), 1), 1)
+        pct_valid = round(100.0 * n_valid / max(len(df_copy), 1), 1)
 
         is_num = pd.api.types.is_numeric_dtype(s)
-        mean_val = round(float(s.mean()), 3) if is_num and n_valid > 0 else np.nan
-        std_val = round(float(s.std()), 3) if is_num and n_valid > 1 else np.nan
-        min_val = round(float(s.min()), 3) if is_num and n_valid > 0 else (str(s.dropna().min())[:20] if n_valid > 0 else np.nan)
-        max_val = round(float(s.max()), 3) if is_num and n_valid > 0 else (str(s.dropna().max())[:20] if n_valid > 0 else np.nan)
+        mean_val = f"{round(float(s.mean()), 3):.3f}" if is_num and n_valid > 0 else "-"
+        std_val = f"{round(float(s.std()), 3):.3f}" if is_num and n_valid > 1 else "-"
+
+        if is_num and n_valid > 0:
+            min_val = f"{round(float(s.min()), 3):.3f}"
+            max_val = f"{round(float(s.max()), 3):.3f}"
+        elif n_valid > 0:
+            s_non_null = s.dropna().astype(str)
+            min_val = str(s_non_null.min())[:30] if len(s_non_null) > 0 else "-"
+            max_val = str(s_non_null.max())[:30] if len(s_non_null) > 0 else "-"
+        else:
+            min_val = "-"
+            max_val = "-"
+
         n_unique = int(s.nunique(dropna=True))
 
         rows.append({
-            "Variable_Name": col,
+            "Variable_Name": str(col),
             "Data_Type": str(s.dtype),
             "N_Valid": n_valid,
             "N_Missing": n_missing,
             "Pct_Valid": pct_valid,
             "Unique_Values": n_unique,
-            "Mean": mean_val,
-            "Std_Dev": std_val,
-            "Min": min_val,
-            "Max": max_val,
+            "Mean": str(mean_val),
+            "Std_Dev": str(std_val),
+            "Min": str(min_val),
+            "Max": str(max_val),
         })
-    return pd.DataFrame(rows)
+    df_dict = pd.DataFrame(rows)
+    for col_name in ["Variable_Name", "Data_Type", "Mean", "Std_Dev", "Min", "Max"]:
+        df_dict[col_name] = df_dict[col_name].astype(str)
+    return df_dict
 
 
 def generate_reproducible_script(filename, options):
@@ -1349,8 +1409,14 @@ def build_b3_b4_bijection(df):
         raise KFLSchemaMismatchError(
             f"Uploaded workbook is missing required benchmark columns: {unique_missing[:5]}."
         )
-    b3_cols = [df.columns.get_loc(p[0]) for p in match_pairs]
-    b4_cols = [df.columns.get_loc(p[1]) for p in match_pairs]
+    def get_first_loc(c):
+        loc = df.columns.get_loc(c)
+        if isinstance(loc, (slice, np.ndarray)):
+            return int(np.where(df.columns == c)[0][0])
+        return int(loc)
+
+    b3_cols = [get_first_loc(p[0]) for p in match_pairs]
+    b4_cols = [get_first_loc(p[1]) for p in match_pairs]
 
     b3_sigs = {}
     for r3 in range(113, 292):

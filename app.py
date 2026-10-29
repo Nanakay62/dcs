@@ -257,10 +257,11 @@ if app_mode.startswith("🎯"):
     except (engine.KFLSchemaMismatchError, KeyError, IndexError, ValueError) as err:
         st.warning(
             f"⚠️ **Dataset Schema Notice**: {str(err)}\n\n"
-            "This preset pipeline is designed specifically for the **9-block Swedish raw survey Masterfile benchmark** "
-            "(containing cohorts B0–B8 and raw survey items like `bakgrund20`, `var0400`, `Tegelsten`).\n\n"
-            "If you are uploading an arbitrary survey, questionnaire, or general tabular spreadsheet, "
-            "please use the **Universal Messy Excel & Survey Cleaner**."
+            "This preset pipeline is designed specifically for the **raw 9-block Swedish survey Masterfile benchmark** "
+            "(containing raw uncleaned cohorts B0–B8 with 619 rows, to reconstruct the 342-manager validated cohort).\n\n"
+            "If you are uploading an **already cleaned survey dataset** (e.g. 409 unique respondents, 342 thesis sample) "
+            "or an arbitrary questionnaire/Excel spreadsheet, click the button below to open it directly in the "
+            "**Universal Cleaner & Statistical Data Analysis Studio**."
         )
         col_act1, col_act2 = st.columns(2)
         with col_act1:
@@ -756,6 +757,9 @@ elif app_mode.startswith("🔍"):
         st.stop()
 
     df_raw_sheet = None
+    if hasattr(uploaded_general, "seek"):
+        uploaded_general.seek(0)
+
     if uploaded_general.name.endswith(".csv"):
         df_raw_sheet = pd.read_csv(uploaded_general, header=None)
         file_display_name = uploaded_general.name
@@ -767,17 +771,24 @@ elif app_mode.startswith("🔍"):
         if len(sheet_names) > 1:
             sheet_mode = st.sidebar.radio(
                 f"Workbook has {len(sheet_names)} sheets:",
-                ["Consolidate all sheets into one table", "Select a single sheet"],
+                ["Select a single sheet", "Consolidate all sheets into one table"],
+                index=0,
             )
             if "Consolidate" in sheet_mode:
+                if hasattr(uploaded_general, "seek"):
+                    uploaded_general.seek(0)
                 df_raw_sheet = engine.consolidate_multisheet_excel(uploaded_general)
                 file_display_name = f"{uploaded_general.name} (All {len(sheet_names)} Sheets Merged)"
             else:
-                chosen_sheet = st.sidebar.selectbox("Choose Sheet:", sheet_names)
-                df_raw_sheet = xl.parse(chosen_sheet, header=None)
+                chosen_sheet = st.sidebar.selectbox("Choose Sheet:", sheet_names, index=0)
+                if hasattr(uploaded_general, "seek"):
+                    uploaded_general.seek(0)
+                df_raw_sheet = pd.read_excel(uploaded_general, sheet_name=chosen_sheet, header=None)
                 file_display_name = f"{uploaded_general.name} [{chosen_sheet}]"
         else:
-            df_raw_sheet = xl.parse(sheet_names[0], header=None)
+            if hasattr(uploaded_general, "seek"):
+                uploaded_general.seek(0)
+            df_raw_sheet = pd.read_excel(uploaded_general, sheet_name=sheet_names[0], header=None)
             file_display_name = uploaded_general.name
 
     st.write(f"**Loaded target:** `{file_display_name}` (`{df_raw_sheet.shape[0]} rows × {df_raw_sheet.shape[1]} columns`)")
@@ -798,9 +809,10 @@ elif app_mode.startswith("🔍"):
     if merge_headers:
         df_working = engine.merge_multi_headers(df_raw_sheet, [header_row_choice, header_row_choice + 1])
     else:
-        headers = [engine.clean_text_hygiene(v) if pd.notna(v) and engine.clean_text_hygiene(v) else f"Column_{i+1}" for i, v in enumerate(df_raw_sheet.iloc[header_row_choice])]
+        raw_headers = [engine.clean_text_hygiene(v) if pd.notna(v) and engine.clean_text_hygiene(v) else f"Column_{i+1}" for i, v in enumerate(df_raw_sheet.iloc[header_row_choice])]
+        unique_headers = engine.make_columns_unique(raw_headers)
         df_working = df_raw_sheet.iloc[header_row_choice + 1:].copy().reset_index(drop=True)
-        df_working.columns = headers
+        df_working.columns = unique_headers
 
     # X-Ray Diagnostic Report
     xray = engine.xray_inspect_spreadsheet(df_working)
