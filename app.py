@@ -1181,9 +1181,18 @@ elif app_mode.startswith("🔍"):
                 hlm_y = st.selectbox("Select Dependent Variable (Y):", options=num_cols_analysis, key="hlm_y")
                 hlm_preds_opts = [c for c in num_cols_analysis if c != hlm_y]
                 hlm_x = st.multiselect("Select Fixed Predictors (X):", options=hlm_preds_opts, default=hlm_preds_opts[:min(2, len(hlm_preds_opts))], key="hlm_x")
-                hlm_grp_opts = [c for c in all_cols_analysis if c != hlm_y]
+                
+                # Exclude variables already chosen as fixed predictors to prevent collinear self-clustering
+                hlm_grp_opts = [c for c in all_cols_analysis if c != hlm_y and c not in hlm_x]
+                if not hlm_grp_opts:
+                    hlm_grp_opts = [c for c in all_cols_analysis if c != hlm_y]
                 hlm_group = st.selectbox("Select Cluster / Grouping Variable (Level-2 Group):", options=hlm_grp_opts, key="hlm_grp")
-                hlm_slopes = st.multiselect("Optional: Random Slopes (Predictors whose slopes vary by group):", options=hlm_x, key="hlm_slopes")
+                
+                if hlm_group in hlm_x:
+                    st.warning(f"⚠️ **Selection Conflict**: '{hlm_group}' is selected as both a fixed predictor (X) and the cluster grouping variable. In hierarchical linear modeling, the grouping variable defines the Level-2 clusters (random intercepts) and cannot predict itself. Please remove '{hlm_group}' from Fixed Predictors above.")
+
+                hlm_slopes_opts = [c for c in hlm_x if c != hlm_group]
+                hlm_slopes = st.multiselect("Optional: Random Slopes (Predictors whose slopes vary by group):", options=hlm_slopes_opts, key="hlm_slopes")
 
                 if st.button("🚀 Fit Multi-Level Model", key="btn_run_hlm", use_container_width=True):
                     if hlm_y and hlm_x and hlm_group:

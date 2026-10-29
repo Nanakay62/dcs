@@ -1134,15 +1134,16 @@ def compute_multilevel_hlm(df, y_col, fixed_cols, group_col, random_slopes=None)
     Computes Multi-Level Hierarchical Linear Modeling (HLM / Mixed-Effects Linear Model)
     using statsmodels MixedLM. Estimates fixed effect coefficients with 95% CIs,
     random intercept variance (tau_00), residual variance (sigma^2), and Intraclass Correlation (ICC).
+    Safeguards against group/predictor overlap, collinearity, and patsy special characters.
     """
     try:
         import statsmodels.api as sm
         from statsmodels.regression.mixed_linear_model import MixedLM
+        import warnings
     except ImportError:
         return {"error": "The 'statsmodels' package is required for Multi-Level Hierarchical Linear Modeling."}
 
     try:
-        import warnings
         if y_col not in df.columns:
             return {"error": f"Dependent variable '{y_col}' was not found in the dataset."}
         if group_col not in df.columns:
@@ -1151,34 +1152,78 @@ def compute_multilevel_hlm(df, y_col, fixed_cols, group_col, random_slopes=None)
         if missing_x:
             return {"error": f"Predictor column(s) {missing_x} were not found in the dataset."}
 
-        cols = [y_col] + list(fixed_cols) + [group_col]
-        clean = df[cols].copy()
-        for c in [y_col] + list(fixed_cols):
-            clean[c] = pd.to_numeric(clean[c], errors='coerce')
-        clean[group_col] = clean[group_col].astype(str).str.strip()
+        # Guard against predictor and cluster overlap
+        if group_col in fixed_cols:
+            return {
+                "error": (
+                    f"Selection conflict: The grouping/cluster variable '{group_col}' cannot also be included in Fixed Predictors (X). "
+                    f"In hierarchical linear modeling, the grouping variable defines the Level-2 clusters (random intercepts) and cannot predict itself. "
+                    f"Please remove '{group_col}' from Fixed Predictors."
+                )
+            }
+
+        if y_col in fixed_cols:
+            return {"error": f"Dependent variable '{y_col}' cannot also be included as a predictor (X)."}
+        if y_col == group_col:
+            return {"error": f"Dependent variable '{y_col}' cannot also be the grouping cluster."}
+
+        valid_fixed = [c for c in fixed_cols if c != group_col and c != y_col and c in df.columns]
+        if not valid_fixed:
+            return {"error": "Please select at least 1 predictor (X) distinct from the outcome and grouping variable."}
+
+        # Safe single-column extraction preventing duplicate column DataFrame slices
+        clean = pd.DataFrame(index=df.index)
+        clean[y_col] = pd.to_numeric(df[y_col], errors="coerce")
+        for c in valid_fixed:
+            clean[c] = pd.to_numeric(df[c], errors="coerce")
+        clean[group_col] = df[group_col].astype(str).str.strip()
         clean = clean.dropna()
 
         if len(clean) < 10:
-            return {"error": f"Insufficient complete rows ({len(clean)}) for multi-level mixed modeling. At least 10 complete cases required."}
+            return {"error": f"Insufficient complete rows ({len(clean)} found) after excluding missing data. At least 10 complete cases required."}
 
         n_groups = clean[group_col].nunique()
         if n_groups < 2:
-            return {"error": f"Grouping variable '{group_col}' has only {n_groups} group/cluster. At least 2 groups required to compute between-group variance."}
+            return {"error": f"Grouping variable '{group_col}' has only {n_groups} group/cluster in the valid sample. At least 2 groups required to compute between-group variance."}
 
-        formula = f"{y_col} ~ " + " + ".join(fixed_cols)
+        zero_x = [c for c in valid_fixed if clean[c].std(ddof=1) == 0 or clean[c].nunique() <= 1]
+        if zero_x:
+            return {"error": f"Predictor(s) {zero_x} have zero variance (identical values for all respondents). Predictors must vary."}
+
+        # Use patsy Q("col") to protect against spaces, dots, dashes, parentheses
+        formula = f'Q("{y_col}") ~ ' + ' + '.join([f'Q("{c}")' for c in valid_fixed])
         re_formula = None
         if random_slopes:
-            valid_slopes = [s for s in random_slopes if s in fixed_cols]
+            valid_slopes = [s for s in random_slopes if s in valid_fixed]
             if valid_slopes:
-                re_formula = " + ".join(valid_slopes)
+                re_formula = ' + '.join([f'Q("{s}")' for s in valid_slopes])
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model = MixedLM.from_formula(formula, clean, groups=clean[group_col], re_formula=re_formula)
             try:
                 fit = model.fit(reml=True, method=["lbfgs", "bfgs"])
-            except Exception:
-                fit = model.fit(reml=True)
+            except np.linalg.LinAlgError:
+                return {
+                    "error": (
+                        "Multi-level model estimation failed due to a Singular Matrix (extreme collinearity). "
+                        "One or more predictors have zero variance within clusters or are redundant with the cluster definition. "
+                        "Please remove collinear predictors or select a different Level-2 grouping variable."
+                    )
+                }
+            except Exception as fit_err:
+                if "Singular matrix" in str(fit_err) or "singular" in str(fit_err).lower():
+                    return {
+                        "error": (
+                            "Multi-level model estimation failed due to a Singular Matrix (extreme collinearity). "
+                            "One or more predictors have zero variance within clusters or are redundant with the cluster definition. "
+                            "Please remove collinear predictors or select a different Level-2 grouping variable."
+                        )
+                    }
+                try:
+                    fit = model.fit(reml=True)
+                except Exception as fit_err2:
+                    return {"error": f"Multi-level model optimization failed: {str(fit_err2)}"}
 
         fe_params = fit.fe_params
         bse = fit.bse_fe
@@ -1190,8 +1235,9 @@ def compute_multilevel_hlm(df, y_col, fixed_cols, group_col, random_slopes=None)
         for term in fe_params.index:
             p = float(pvalues.get(term, np.nan))
             stars = "***" if p < 0.001 else ("**" if p < 0.01 else ("*" if p < 0.05 else ""))
+            clean_term = term.replace('Q("', '').replace('")', '')
             rows.append({
-                "Parameter": term,
+                "Parameter": clean_term,
                 "Estimate (B)": round(float(fe_params[term]), 4),
                 "Std. Error": round(float(bse.get(term, np.nan)), 4),
                 "z-value": round(float(tvalues.get(term, np.nan)), 3),
@@ -1225,7 +1271,8 @@ def compute_multilevel_hlm(df, y_col, fixed_cols, group_col, random_slopes=None)
             "is_success": True
         }
     except Exception as e:
-        return {"error": f"Multi-Level Model estimation failed: {str(e)}"}
+        return {"error": f"Multi-level model estimation failed: {str(e)}"}
+
 
 
 def compute_repeated_measures_anova(df, time_cols, between_col=None):
