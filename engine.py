@@ -1,24 +1,28 @@
 """
 engine.py
 =========
-Universal Spreadsheet & Survey Data Cleaning Engine.
+Universal Spreadsheet & Survey Data Cleaning and Statistical Analysis Engine.
 Powers the Streamlit Data Cleaning Studio (`app.py`) and reproducible batch scripts.
 
 Includes:
-- Complete forensic reconstruction of KFL/CPE Survey (Lund University 2025 thesis)
+- Complete forensic reconstruction of KFL/CPE Survey (Andersson & Malm 2025 benchmark)
 - Universal Structural & Multi-Table Reconstruction (Auto headers, stacked tables, multi-sheet consolidation, summary row stripping)
 - Cell-level parsing (Disguised missing sentinels, currency/percentages/European decimals, Likert 5 & 7 point scales)
 - Psychometric Quality Control (Straightliner / careless response detection, Cronbach's alpha + "alpha if item deleted", reverse-coding)
-- Auto-codebook & reproducible Python script generation
+- Statistical Analysis Engine (Correlation matrices, PCA/Factor loadings, OLS multiple regression, group comparisons)
+- Dual-Engine Reproducibility (Auto-codebook, Python & R script generation)
 """
 
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 import datetime
 import io
+import os
 import re
+import subprocess
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 # ---------------------------------------------------------------------------
 # 1. Scale & Item Dictionaries
@@ -124,11 +128,11 @@ SENTINEL_VALUES = {
     "999", "-99", "99", "9999", "-999",
 }
 
-# Summary row indicators
+# Summary row indicators (normalized word roots and prefixes)
 SUMMARY_KEYWORDS = [
     "total", "subtotal", "grand total", "sum", "average", "avg", "mean",
     "median", "count", "totalt", "summa", "medeltal", "genomsnitt", "sammanfattning",
-    "source:", "källa:", "note:", "anmärkning:", "copyright",
+    "source", "källa", "note", "notes", "noter", "anmärkning", "copyright", "footnote", "footnotes",
 ]
 
 # KFL Model Constants
@@ -203,8 +207,9 @@ def fix_excel_date_range(val):
 def parse_numeric_cell(val):
     """
     Universal numeric parser:
-    Handles currency ($1,200.50, 1.200,50 kr, €45), percentages (25.5%),
-    European comma decimals, and Likert text conversion.
+    Handles currency ($1,200.50, 1.200,50 kr, €45, 150 GBP, CAD 250), percentages (25.5%),
+    European comma decimals, space thousands separators (1 234,56), accounting negative
+    parentheses ($50.00), and Likert text conversion.
     """
     if pd.isna(val):
         return np.nan
@@ -224,11 +229,21 @@ def parse_numeric_cell(val):
     if s_low in LIKERT_TEXT_MAP:
         return float(LIKERT_TEXT_MAP[s_low])
 
-    # Remove currency symbols and extraneous whitespace
-    s_clean = re.sub(r'[$€£¥krSEKUSDNOKDKK]', '', s, flags=re.IGNORECASE).strip()
+    # Check for accounting negative format: "(50.00)" or "($1,200)"
+    is_negative = False
+    if s.startswith("(") and s.endswith(")"):
+        is_negative = True
+        s = s[1:-1].strip()
+
+    # Remove currency symbols and word tokens (USD, EUR, GBP, SEK, kr, etc.)
+    curr_pattern = r'(?:[$€£¥₹₽₩₪₺₫]|\b(?:SEK|USD|EUR|GBP|NOK|DKK|CAD|AUD|CHF|JPY|CNY|kr|krona|kronor)\b)'
+    s_clean = re.sub(curr_pattern, '', s, flags=re.IGNORECASE).strip()
     s_clean = s_clean.replace('%', '').strip()
 
-    # Handle European decimal: e.g. "1.234,56" or "1 234,56" or "12,5"
+    # Normalize space thousands separators: e.g. "1 234,56" or "1 200"
+    s_clean = re.sub(r'(\d)\s+(\d)', r'\1\2', s_clean)
+
+    # Handle European decimal: e.g. "1.234,56" or "12,5" vs US "1,234.56"
     if ',' in s_clean and '.' in s_clean:
         if s_clean.find('.') < s_clean.find(','):
             # European: 1.234,56
@@ -249,7 +264,8 @@ def parse_numeric_cell(val):
         s_clean = '0' + s_clean
 
     try:
-        return float(s_clean)
+        num = float(s_clean)
+        return -num if is_negative else num
     except ValueError:
         return np.nan
 
@@ -351,9 +367,12 @@ def detect_and_strip_stacked_tables(df_raw):
 
         sections.append((idx, current_section))
 
-    sec_map = dict(sections)
-    d["source_section"] = [sec_map.get(i, "Main") for i in d.index]
-    d = d.drop(index=rows_to_drop).reset_index(drop=True)
+    has_sections = any(sec != "Main" for _, sec in sections) or len(rows_to_drop) > 0
+    if has_sections:
+        sec_map = dict(sections)
+        d["source_section"] = [sec_map.get(i, "Main") for i in d.index]
+    if rows_to_drop:
+        d = d.drop(index=rows_to_drop).reset_index(drop=True)
     return d
 
 
@@ -596,18 +615,36 @@ def clean_general_dataframe(df_raw,
 # 5. Psychometric Quality Control (Category C)
 # ---------------------------------------------------------------------------
 
-def compute_cronbach_alpha(df_items):
-    """Compute Cronbach's alpha on a DataFrame of numeric items."""
-    clean = df_items.apply(pd.to_numeric, errors='coerce').dropna()
+def compute_cronbach_alpha(df_items, use_pairwise_if_needed=True):
+    """
+    Compute Cronbach's alpha on a DataFrame of numeric items.
+    Supports complete listwise cases with automatic pairwise covariance fallback
+    when missing responses exist.
+    """
+    clean = df_items.apply(pd.to_numeric, errors='coerce')
+    clean_listwise = clean.dropna()
     k = clean.shape[1]
-    if k < 2 or len(clean) < 3:
+    if k < 2:
         return np.nan
-    item_vars = clean.var(axis=0, ddof=1).sum()
-    total_var = clean.sum(axis=1).var(ddof=1)
-    if total_var == 0 or np.isnan(total_var):
-        return np.nan
-    alpha = (k / (k - 1)) * (1.0 - (item_vars / total_var))
-    return float(alpha)
+
+    # Try listwise complete if >= 5 rows
+    if len(clean_listwise) >= 5:
+        item_vars = clean_listwise.var(axis=0, ddof=1).sum()
+        total_var = clean_listwise.sum(axis=1).var(ddof=1)
+        if total_var > 0 and pd.notna(total_var):
+            alpha = (k / (k - 1)) * (1.0 - (item_vars / total_var))
+            return float(alpha)
+
+    # Pairwise covariance fallback if listwise drops too many rows
+    if use_pairwise_if_needed and len(clean) >= 5:
+        cov_matrix = clean.cov()
+        item_vars = np.diag(cov_matrix).sum()
+        total_var = cov_matrix.values.sum()
+        if total_var > 0 and pd.notna(total_var) and item_vars > 0:
+            alpha = (k / (k - 1)) * (1.0 - (item_vars / total_var))
+            return float(alpha)
+
+    return np.nan
 
 
 def compute_alpha_with_item_deleted(df_items):
@@ -618,12 +655,17 @@ def compute_alpha_with_item_deleted(df_items):
     clean = df_items.apply(pd.to_numeric, errors='coerce').dropna()
     k = clean.shape[1]
     if k < 2 or len(clean) < 3:
-        return None
+        # Try with pairwise if rows exist
+        raw_items = df_items.apply(pd.to_numeric, errors='coerce')
+        if len(raw_items.dropna(how='all')) >= 3 and k >= 2:
+            clean = raw_items
+        else:
+            return None
 
     overall_alpha = compute_cronbach_alpha(clean)
     results = []
 
-    total_score = clean.sum(axis=1)
+    total_score = clean.sum(axis=1, skipna=True)
 
     for col in clean.columns:
         rest = clean.drop(columns=[col])
@@ -654,8 +696,9 @@ def detect_survey_quality_issues(df_raw, item_cols, straightline_threshold=0.0):
     row_stds = sub.std(axis=1, skipna=True)
     row_non_na = sub.notna().sum(axis=1)
 
-    # Flag straightliners (standard deviation <= straightline_threshold across at least 4 items)
-    is_straightline = (row_stds <= straightline_threshold) & (row_non_na >= 4)
+    min_items = min(3, len(item_cols))
+    # Flag straightliners (standard deviation <= straightline_threshold across sufficient items)
+    is_straightline = (row_stds <= straightline_threshold) & (row_non_na >= min_items)
 
     # Multi-item outlier score (Z-score of row means)
     row_means = sub.mean(axis=1, skipna=True)
@@ -685,6 +728,364 @@ def reverse_code_items(df, item_cols, scale_min=1, scale_max=5):
             rev_name = f"{col}_Rev"
             d[rev_name] = (scale_max + scale_min) - pd.to_numeric(d[col], errors='coerce')
     return d
+
+
+# ---------------------------------------------------------------------------
+# 6. Statistical Analysis Engine (Correlation, Regression, EFA, Group Tests)
+# ---------------------------------------------------------------------------
+
+def compute_correlation_matrix(df, cols, method="pearson"):
+    """
+    Computes bivariate correlation matrix with p-values and significance stars.
+    """
+    sub = df[cols].apply(pd.to_numeric, errors='coerce')
+    corr_df = pd.DataFrame(index=cols, columns=cols, dtype=float)
+    pval_df = pd.DataFrame(index=cols, columns=cols, dtype=float)
+    stars_df = pd.DataFrame(index=cols, columns=cols, dtype=object)
+
+    for c1 in cols:
+        for c2 in cols:
+            if c1 == c2:
+                r, p = 1.0, 0.0
+            else:
+                v1 = sub[c1]
+                v2 = sub[c2]
+                mask = v1.notna() & v2.notna()
+                if mask.sum() < 3:
+                    r, p = np.nan, np.nan
+                else:
+                    if method == "spearman":
+                        r_val, p_val = stats.spearmanr(v1[mask], v2[mask])
+                    else:
+                        r_val, p_val = stats.pearsonr(v1[mask], v2[mask])
+                    r = float(r_val)
+                    p = float(p_val)
+
+            corr_df.loc[c1, c2] = round(r, 4) if pd.notna(r) else np.nan
+            pval_df.loc[c1, c2] = round(p, 4) if pd.notna(p) else np.nan
+            if pd.isna(p):
+                stars = ""
+            elif p < 0.001:
+                stars = "***"
+            elif p < 0.01:
+                stars = "**"
+            elif p < 0.05:
+                stars = "*"
+            else:
+                stars = ""
+            stars_df.loc[c1, c2] = f"{r:.3f}{stars}" if pd.notna(r) else "NaN"
+
+    return {"corr": corr_df, "pval": pval_df, "formatted": stars_df}
+
+
+def compute_linear_regression(df, y_col, x_cols):
+    """
+    Computes OLS Multiple Linear Regression model with R^2, standard errors, t-stats, and p-values.
+    """
+    cols = [y_col] + list(x_cols)
+    clean = df[cols].apply(pd.to_numeric, errors='coerce').dropna()
+    n = len(clean)
+    k = len(x_cols)
+    if n <= k + 1:
+        return None
+
+    y = clean[y_col].values
+    X = np.column_stack([np.ones(n), clean[x_cols].values])
+
+    try:
+        beta, residuals, rank, s = np.linalg.lstsq(X, y, rcond=None)
+    except Exception:
+        return None
+
+    y_pred = X @ beta
+    ss_total = np.sum((y - np.mean(y)) ** 2)
+    ss_resid = np.sum((y - y_pred) ** 2)
+    r_squared = 1.0 - (ss_resid / ss_total) if ss_total > 0 else 0.0
+    adj_r_squared = 1.0 - (1.0 - r_squared) * ((n - 1) / (n - k - 1)) if n > k + 1 else r_squared
+
+    sigma2 = ss_resid / (n - k - 1) if n > k + 1 else 0.0
+    try:
+        var_beta = sigma2 * np.linalg.inv(X.T @ X)
+        se = np.sqrt(np.maximum(0, np.diag(var_beta)))
+    except Exception:
+        se = np.full(k + 1, np.nan)
+
+    t_stats = beta / np.where(se == 0, np.nan, se)
+    p_values = [2.0 * (1.0 - stats.t.cdf(np.abs(t), df=n - k - 1)) if pd.notna(t) else np.nan for t in t_stats]
+
+    f_stat = ((ss_total - ss_resid) / k) / (ss_resid / (n - k - 1)) if (k > 0 and n > k + 1 and ss_resid > 0) else np.nan
+    f_pval = 1.0 - stats.f.cdf(f_stat, k, n - k - 1) if pd.notna(f_stat) else np.nan
+
+    var_names = ["(Intercept)"] + list(x_cols)
+    results_df = pd.DataFrame({
+        "Predictor": var_names,
+        "Coefficient (B)": np.round(beta, 4),
+        "Std Error": np.round(se, 4),
+        "t-statistic": np.round(t_stats, 3),
+        "p-value": np.round(p_values, 4),
+        "Sig": ["***" if p < 0.001 else ("**" if p < 0.01 else ("*" if p < 0.05 else "")) for p in p_values]
+    })
+
+    return {
+        "n_obs": n,
+        "r_squared": round(float(r_squared), 4),
+        "adj_r_squared": round(float(adj_r_squared), 4),
+        "f_stat": round(float(f_stat), 3) if pd.notna(f_stat) else np.nan,
+        "f_pval": round(float(f_pval), 4) if pd.notna(f_pval) else np.nan,
+        "table": results_df,
+    }
+
+
+def compute_pca_factor_analysis(df, cols, n_factors=3):
+    """
+    Computes Principal Component / Factor loadings and explained variance.
+    """
+    clean = df[cols].apply(pd.to_numeric, errors='coerce').dropna()
+    if len(clean) < 5 or len(cols) < 2:
+        return None
+
+    corr_mat = clean.corr().values
+    eigvals, eigvecs = np.linalg.eigh(corr_mat)
+
+    idx = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[idx]
+    eigvecs = eigvecs[:, idx]
+
+    n_comps = min(n_factors, len(cols))
+    var_explained = (eigvals[:n_comps] / len(cols)) * 100.0
+    cum_var = np.cumsum(var_explained)
+
+    loadings = eigvecs[:, :n_comps] * np.sqrt(np.maximum(0, eigvals[:n_comps]))
+
+    loadings_df = pd.DataFrame(
+        loadings.round(3),
+        index=cols,
+        columns=[f"Factor {i+1}" for i in range(n_comps)]
+    )
+
+    scree_df = pd.DataFrame({
+        "Component": [f"Factor {i+1}" for i in range(n_comps)],
+        "Eigenvalue": eigvals[:n_comps].round(3),
+        "Variance Explained (%)": var_explained.round(1),
+        "Cumulative Variance (%)": cum_var.round(1),
+    })
+
+    return {
+        "loadings": loadings_df,
+        "scree": scree_df,
+        "n_obs": len(clean),
+    }
+
+
+def compute_group_comparison(df, group_col, metric_col):
+    """
+    Computes descriptive breakdown and Independent samples t-test across 2 groups.
+    """
+    clean = df[[group_col, metric_col]].dropna()
+    groups = clean[group_col].unique()
+    if len(groups) < 2:
+        return None
+
+    g1_vals = clean[clean[group_col] == groups[0]][metric_col].apply(pd.to_numeric, errors='coerce').dropna()
+    g2_vals = clean[clean[group_col] == groups[1]][metric_col].apply(pd.to_numeric, errors='coerce').dropna()
+
+    if len(g1_vals) < 2 or len(g2_vals) < 2:
+        return None
+
+    t_stat, p_val = stats.ttest_ind(g1_vals, g2_vals, equal_var=False)
+
+    pooled_sd = np.sqrt(
+        (((len(g1_vals) - 1) * g1_vals.var()) + ((len(g2_vals) - 1) * g2_vals.var()))
+        / (len(g1_vals) + len(g2_vals) - 2)
+    )
+    d_val = (g1_vals.mean() - g2_vals.mean()) / pooled_sd if pooled_sd > 0 else 0.0
+
+    summary_df = pd.DataFrame([
+        {"Group": str(groups[0]), "N": len(g1_vals), "Mean": round(g1_vals.mean(), 3), "SD": round(g1_vals.std(), 3)},
+        {"Group": str(groups[1]), "N": len(g2_vals), "Mean": round(g2_vals.mean(), 3), "SD": round(g2_vals.std(), 3)},
+    ])
+
+    return {
+        "summary": summary_df,
+        "t_stat": round(float(t_stat), 3),
+        "p_val": round(float(p_val), 4),
+        "cohens_d": round(float(d_val), 3),
+        "group_names": (str(groups[0]), str(groups[1])),
+    }
+
+
+def replicate_thesis_table_3(df_thesis):
+    """
+    Replicates Andersson & Malm (2025) Table 3 Convergent Validity Correlation Analyses (N = 122).
+    """
+    pairs = [
+        ("KFL Total & CPE Change/Employee (CE)", "KFL_Total_18", "CPE_CE_Combined_Mean", 0.269, 0.271),
+        ("KFL Total & CPE Production (P)", "KFL_Total_18", "CPE_Production_Mean", 0.301, 0.330),
+        ("Factor 1 (Idea-Support) & CPE Employee (E)", "KFL_F1_IdeaSupport", "CPE_Employee_Mean", 0.156, 0.307),
+        ("Factor 1 (Idea-Support) & CPE CE Combined", "KFL_F1_IdeaSupport", "CPE_CE_Combined_Mean", 0.095, 0.317),
+        ("Factor 1 & Factor 2 (Autonomy)", "KFL_F1_IdeaSupport", "KFL_F2_Autonomy", 0.377, 0.360),
+        ("Factor 2 (Autonomy) & CPE Production (P)", "KFL_F2_Autonomy", "CPE_Production_Mean", 0.411, 0.407),
+        ("Factor 3 (Conservatism) & CPE Change (C)", "KFL_F3_Conservatism", "CPE_Change_Mean", -0.534, -0.502),
+        ("Factor 3 (Conservatism) & CPE CE Combined", "KFL_F3_Conservatism", "CPE_CE_Combined_Mean", -0.488, -0.461),
+        ("Factor 3 (Conservatism) & CPE Production (P)", "KFL_F3_Conservatism", "CPE_Production_Mean", -0.302, -0.258),
+    ]
+
+    rows = []
+    for label, col1, col2, th_r, th_rho in pairs:
+        if col1 in df_thesis.columns and col2 in df_thesis.columns:
+            sub = df_thesis[[col1, col2]].dropna()
+            if len(sub) >= 5:
+                r, p_r = stats.pearsonr(sub[col1], sub[col2])
+                rho, p_rho = stats.spearmanr(sub[col1], sub[col2])
+                star_r = "***" if p_r < 0.001 else ("**" if p_r < 0.01 else ("*" if p_r < 0.05 else ""))
+                star_rho = "***" if p_rho < 0.001 else ("**" if p_rho < 0.01 else ("*" if p_rho < 0.05 else ""))
+                rows.append({
+                    "Scale Dimension Pair": label,
+                    "Replicated Pearson r": f"{r:+.3f}{star_r}",
+                    "Published Pearson r": f"{th_r:+.3f}",
+                    "Replicated Spearman ρ": f"{rho:+.3f}{star_rho}",
+                    "Published Spearman ρ": f"{th_rho:+.3f}",
+                    "Sample Size N": len(sub),
+                })
+
+    return pd.DataFrame(rows)
+
+
+def generate_r_analysis_script(filename, num_cols, factor_dict=None, y_col=None, x_cols=None):
+    """
+    Generates a complete, publication-ready R analysis script (`survey_analysis.R`).
+    Uses tidyverse, psych (alpha, describe, fa), lavaan (CFA), and corrplot.
+    """
+    scale_items_str = ', '.join(f'"{c}"' for c in num_cols[:min(18, len(num_cols))])
+    r_script = f'''# ==============================================================================
+# R Statistical & Psychometric Analysis Script
+# Target Dataset: {filename}
+# Generated by: Dycson Cleaning Studio
+# ==============================================================================
+
+# 1. Package Installation and Loading
+required_packages <- c("tidyverse", "psych", "lavaan", "corrplot")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+if (length(new_packages) > 0) install.packages(new_packages)
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+cat("\\n=======================================================\\n")
+cat("  Dycson Cleaning Studio: R Statistical Analysis Engine  \\n")
+cat("=======================================================\\n\\n")
+
+# 2. Data Loading
+data_file <- "{filename}"
+cat("Loading cleaned dataset:", data_file, "\\n")
+df <- read.csv(data_file, check.names = FALSE, na.strings = c("NA", "NaN", "", "."))
+cat("Dataset Dimensions:", nrow(df), "rows by", ncol(df), "columns\\n\\n")
+
+# 3. Scale Items Definition
+scale_items <- c({scale_items_str})
+cat("Scale items for psychometric evaluation:\\n")
+print(scale_items)
+cat("\\n")
+
+# Subset numeric items
+sub_items <- df[, scale_items, drop = FALSE]
+sub_items <- data.frame(lapply(sub_items, as.numeric))
+
+# 4. Comprehensive Descriptive Statistics & Normality (psych::describe)
+cat("-------------------------------------------------------\\n")
+cat("4. Descriptive Statistics & Normality Assessment\\n")
+cat("-------------------------------------------------------\\n")
+desc_stats <- describe(sub_items)
+print(round(desc_stats[, c("n", "mean", "sd", "median", "skew", "kurtosis", "se")], 3))
+cat("\\n")
+
+# 5. Internal Consistency: Cronbach's Alpha (psych::alpha)
+cat("-------------------------------------------------------\\n")
+cat("5. Reliability Analysis (Cronbach's Alpha & Item-Rest)\\n")
+cat("-------------------------------------------------------\\n")
+if (ncol(sub_items) >= 2) {{
+  alpha_res <- psych::alpha(sub_items, check.keys = TRUE)
+  cat("Overall Raw Alpha:", round(alpha_res$total$raw_alpha, 3), "\\n")
+  cat("Standardized Alpha:", round(alpha_res$total$std.alpha, 3), "\\n\\n")
+  cat("Item-Level Statistics & Alpha if Item Deleted:\\n")
+  print(round(alpha_res$alpha.drop[, c("raw_alpha", "std.alpha")], 3))
+  print(round(alpha_res$item.stats[, c("r.cor", "r.drop", "mean", "sd")], 3))
+}}
+cat("\\n")
+
+# 6. Bivariate Correlation Matrix
+cat("-------------------------------------------------------\\n")
+cat("6. Correlation Matrix (Pearson)\\n")
+cat("-------------------------------------------------------\\n")
+if (ncol(sub_items) >= 2) {{
+  corr_mat <- cor(sub_items, use = "pairwise.complete.obs")
+  print(round(corr_mat, 3))
+}}
+cat("\\n")
+'''
+    if factor_dict:
+        model_lines = []
+        for f_name, items in factor_dict.items():
+            model_lines.append(f"{f_name} =~ {' + '.join(items)}")
+        cfa_model_str = "\n".join(model_lines)
+        r_script += f'''
+# 7. Confirmatory Factor Analysis (lavaan::cfa)
+cat("-------------------------------------------------------\\n")
+cat("7. Confirmatory Factor Analysis (CFA via lavaan)\\n")
+cat("-------------------------------------------------------\\n")
+cfa_model <- '
+{cfa_model_str}
+'
+tryCatch({{
+  fit_cfa <- cfa(cfa_model, data = df, missing = "fiml")
+  cat("CFA Fit Summary:\\n")
+  summary(fit_cfa, fit.measures = TRUE, standardized = TRUE)
+}}, error = function(e) {{
+  cat("CFA Error:", conditionMessage(e), "\\n")
+}})
+cat("\\n")
+'''
+
+    if y_col and x_cols:
+        r_script += f'''
+# 8. Multiple Linear Regression Model
+cat("-------------------------------------------------------\\n")
+cat("8. Multiple Linear Regression Analysis\\n")
+cat("-------------------------------------------------------\\n")
+formula_str <- "{y_col} ~ {' + '.join(x_cols)}"
+cat("Regression Formula:", formula_str, "\\n")
+reg_model <- lm(as.formula(formula_str), data = df)
+print(summary(reg_model))
+cat("\\n")
+'''
+
+    r_script += '''
+cat("=======================================================\\n")
+cat("  Analysis Complete! Generated by Dycson Cleaning Studio \\n")
+cat("=======================================================\\n")
+'''
+    return r_script
+
+
+def run_r_script_if_available(r_script_content, workdir=None):
+    """
+    Checks if Rscript is available and executes the script, returning output.
+    """
+    try:
+        check = subprocess.run(["Rscript", "--version"], capture_output=True, text=True, timeout=5, shell=True)
+        if check.returncode != 0:
+            return {"available": False, "message": "Rscript command returned non-zero code. R may not be installed in system PATH."}
+    except Exception as e:
+        return {"available": False, "message": f"R runtime (Rscript) is not detected on this machine: {str(e)}"}
+
+    script_path = os.path.join(workdir or ".", "temp_survey_analysis.R")
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(r_script_content)
+
+    try:
+        res = subprocess.run(["Rscript", script_path], capture_output=True, text=True, timeout=60, shell=True)
+        return {"available": True, "stdout": res.stdout, "stderr": res.stderr, "exit_code": res.returncode}
+    except Exception as ex:
+        return {"available": True, "stdout": "", "stderr": str(ex), "exit_code": -1}
+
 
 
 # ---------------------------------------------------------------------------
@@ -780,8 +1181,14 @@ def clean_dataset():
     # 5. Map Likert text labels
     {"for c in df.columns: df[c] = df[c].apply(lambda v: LIKERT_MAP.get(str(v).strip().lower(), v))" if options.get("map_likert") else "# Likert untouched"}
 
-    # 6. Deduplication
+    # 6. Parse currency, percentages, European decimals & space thousands
+    {"# Smart currency & number parsing\\n    curr_pattern = r'(?:[$€£¥₹₽₩₪₺₫]|\\b(?:SEK|USD|EUR|GBP|NOK|DKK|CAD|AUD|CHF|JPY|CNY|kr)\\b)'\\n    for c in df.select_dtypes(include='object').columns:\\n        try:\\n            cleaned_col = df[c].astype(str).str.replace(curr_pattern, '', regex=True).str.replace('%', '').str.strip()\\n            cleaned_col = cleaned_col.str.replace(r'(\\d)\\s+(\\d)', r'\\1\\2', regex=True)\\n            df[c] = pd.to_numeric(cleaned_col.str.replace(',', '.'), errors='ignore')\\n        except Exception: pass" if options.get("parse_numbers") else "# Numeric formats kept"}
+
+    # 7. Deduplication
     {"df = df.drop_duplicates().reset_index(drop=True)" if options.get("drop_duplicates") else "# Duplicates kept"}
+
+    # 8. Missing value imputation
+    {"for c in df.select_dtypes(include='number').columns: df[c] = df[c].fillna(df[c].median())" if options.get("imputation") == "median" else ("for c in df.select_dtypes(include='number').columns: df[c] = df[c].fillna(df[c].mean())" if options.get("imputation") == "mean" else "# Missing values kept as NaN")}
 
     print(f"Final cleaned shape: {{df.shape}}")
     df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")

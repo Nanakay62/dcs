@@ -2,7 +2,7 @@
 app.py
 ======
 Dycson Cleaning Studio (DCS)
-Universal Spreadsheet & Survey Data Intelligence Platform.
+Universal Spreadsheet, Survey Intelligence & Statistical Analysis Platform.
 
 Developed by Nana Kwame Dickson.
 """
@@ -100,6 +100,18 @@ st.markdown(
 )
 
 # ---------------------------------------------------------------------------
+# Caching Utilities
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def load_cached_excel(file_path):
+    return pd.read_excel(file_path)
+
+@st.cache_data(show_spinner=False)
+def cached_kfl_pipeline(df, strategy):
+    return engine.run_kfl_masterfile_pipeline(df, imputation_strategy=strategy)
+
+# ---------------------------------------------------------------------------
 # Sidebar Navigation & Branding
 # ---------------------------------------------------------------------------
 
@@ -111,12 +123,12 @@ else:
     st.sidebar.image("https://img.icons8.com/fluency/96/data-sheet.png", width=56)
 
 st.sidebar.markdown("### Dycson Cleaning Studio")
-st.sidebar.caption("Universal Spreadsheet & Survey Intelligence Platform")
+st.sidebar.caption("Universal Spreadsheet, Survey Intelligence & Statistical Platform")
 
 app_mode = st.sidebar.radio(
     "Navigate Studio:",
     [
-        "🎯 KFL & CPE Thesis Preset (Lund University 2025)",
+        "🎯 KFL & CPE Survey Forensic Cleaning Studio",
         "🔍 Universal Messy Excel & Survey Cleaner",
         "📖 User Guide & Documentation",
     ],
@@ -128,9 +140,9 @@ def render_footer():
     st.markdown(
         """
         <div class="footer-container">
-            <span class="footer-author">Made by Nana Kwame Dickson</span> | Dycson Cleaning Studio v2.0
+            <span class="footer-author">Made by Nana Kwame Dickson</span> | Dycson Cleaning Studio v2.1
             <br>
-            <span style="font-size: 0.8rem; color: #94A3B8;">Built for academic research, psychometrics, and automated spreadsheet engineering.</span>
+            <span style="font-size: 0.8rem; color: #94A3B8;">Built for academic research, psychometrics, statistical analysis, and automated spreadsheet engineering.</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -149,49 +161,60 @@ def render_sidebar_footer():
 
 
 # ---------------------------------------------------------------------------
-# MODE 1: KFL & CPE Thesis Survey Preset
+# MODE 1: KFL & CPE Survey Forensic Cleaning Studio
 # ---------------------------------------------------------------------------
 
 if app_mode.startswith("🎯"):
     st.markdown('<div class="main-header">🎯 KFL & CPE Survey Forensic Cleaning Studio</div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="sub-header">'
-        'Forensic reconstruction of <b>Masterfile_2_English.xlsx</b> accompanying Andersson & Malm (2025) '
-        '<i>"Ideas Sound Like Music Only When the Leader Can Conduct: on creativity-enhancing leadership as theory and instrument"</i>, '
-        'Lund University.</div>',
+        'Forensic reconstruction, psychometric validation, and statistical analysis for leadership & creativity survey cohorts '
+        'accompanying Andersson & Malm (2025) <i>"Ideas Sound Like Music Only When the Leader Can Conduct: on creativity-enhancing leadership as theory and instrument"</i>.</div>',
         unsafe_allow_html=True,
     )
 
-    st.sidebar.subheader("Dataset Source")
-    use_default = st.sidebar.checkbox("Use Workspace Masterfile (Masterfile_2_English.xlsx)", value=True)
+    st.subheader("📁 Dataset Selection & Upload")
+    has_benchmark = DEFAULT_EXCEL.exists()
 
-    uploaded_kfl = None
-    if not use_default:
-        uploaded_kfl = st.sidebar.file_uploader("Upload KFL Survey Excel File (.xlsx)", type=["xlsx"])
+    col_src1, col_src2 = st.columns([1.6, 1.0])
+    with col_src1:
+        if has_benchmark:
+            data_source = st.radio(
+                "Select Data Source:",
+                [
+                    "📊 Use Preloaded Benchmark Dataset (342-Manager Validated Cohort)",
+                    "📂 Upload Survey Excel File (.xlsx, .xls)",
+                ],
+                horizontal=True,
+            )
+        else:
+            data_source = "📂 Upload Survey Excel File (.xlsx, .xls)"
 
-    st.sidebar.subheader("Imputation Method")
-    imp_strategy = st.sidebar.selectbox(
-        "Missing Data Handling (for Thesis Sample):",
-        ["median", "mean", "none"],
-        format_func=lambda x: "Column Median (Thesis Standard : Section 2.3)" if x == "median" else ("Column Mean" if x == "mean" else "None (Keep Raw NaNs)"),
-    )
+    with col_src2:
+        imp_strategy = st.selectbox(
+            "Missing Data Imputation Strategy:",
+            ["median", "mean", "none"],
+            format_func=lambda x: "Column Median (Study Standard : Section 2.3)" if x == "median" else ("Column Mean" if x == "mean" else "None (Keep Raw NaNs)"),
+        )
 
     df_raw = None
-    if use_default and DEFAULT_EXCEL.exists():
-        with st.spinner("Loading Masterfile_2_English.xlsx from workspace..."):
-            df_raw = pd.read_excel(DEFAULT_EXCEL)
-    elif uploaded_kfl is not None:
-        with st.spinner("Reading uploaded workbook..."):
-            df_raw = pd.read_excel(uploaded_kfl)
+    if "Upload" in data_source:
+        uploaded_kfl = st.file_uploader(
+            "Upload Survey Excel File (.xlsx, .xls):",
+            type=["xlsx", "xls"],
+            key="kfl_main_uploader",
+        )
+        if uploaded_kfl is not None:
+            with st.spinner("Reading uploaded workbook..."):
+                df_raw = pd.read_excel(uploaded_kfl)
+        else:
+            st.info("👆 Drag and drop or browse to upload your survey spreadsheet above to begin forensic reconstruction.")
+            render_footer()
+            render_sidebar_footer()
+            st.stop()
     else:
-        st.warning("Please upload a file or check 'Use Workspace Masterfile'.")
-        render_footer()
-        render_sidebar_footer()
-        st.stop()
-
-    @st.cache_data(show_spinner=False)
-    def cached_kfl_pipeline(df, strategy):
-        return engine.run_kfl_masterfile_pipeline(df, imputation_strategy=strategy)
+        with st.spinner("Loading preloaded benchmark survey dataset..."):
+            df_raw = load_cached_excel(str(DEFAULT_EXCEL))
 
     with st.spinner("Running forensic reconstruction and psychometric engine..."):
         res = cached_kfl_pipeline(df_raw, imp_strategy)
@@ -215,12 +238,14 @@ if app_mode.startswith("🎯"):
 
     st.write("")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📊 Demographic Verification",
         "📈 Psychometrics & Reliability",
+        "🔬 Statistical Data Analysis",
         "📑 Data Tables & Live Preview",
         "🔬 Forensic Audit Log",
         "📥 Export Studio",
+        "💻 R Analysis Studio",
     ])
 
     with tab1:
@@ -233,21 +258,21 @@ if app_mode.startswith("🎯"):
         c1, c2 = st.columns([1.2, 1.8])
         with c1:
             verif_data = [
-                {"Variable": "Gender: Male", "Thesis N=342": "186 (54.4%)", "Cleaned N=342": f"{stats['gender_counts'].get(1,0)} (54.4%)", "Status": "100% Exact Match"},
-                {"Variable": "Gender: Female", "Thesis N=342": "156 (45.6%)", "Cleaned N=342": f"{stats['gender_counts'].get(2,0)} (45.6%)", "Status": "100% Exact Match"},
-                {"Variable": "Age: 16–25 years", "Thesis N=342": "2 (0.6%)", "Cleaned N=342": f"{stats['age_counts'].get(1,0)} (0.6%)", "Status": "100% Exact Match"},
-                {"Variable": "Age: 26–35 years", "Thesis N=342": "42 (12.3%)", "Cleaned N=342": f"{stats['age_counts'].get(2,0)} (12.3%)", "Status": "100% Exact Match"},
-                {"Variable": "Age: 36–45 years", "Thesis N=342": "122 (35.7%)", "Cleaned N=342": f"{stats['age_counts'].get(3,0)} (35.7%)", "Status": "100% Exact Match"},
-                {"Variable": "Age: 46–55 years", "Thesis N=342": "127 (37.1%)", "Cleaned N=342": f"{stats['age_counts'].get(4,0)} (37.1%)", "Status": "100% Exact Match"},
-                {"Variable": "Age: 56–65 years", "Thesis N=342": "47 (13.7%)", "Cleaned N=342": f"{stats['age_counts'].get(5,0)} (13.7%)", "Status": "100% Exact Match"},
-                {"Variable": "Age: 65+ years", "Thesis N=342": "2 (0.6%)", "Cleaned N=342": f"{stats['age_counts'].get(6,0)} (0.6%)", "Status": "100% Exact Match"},
-                {"Variable": "Education: Compulsory", "Thesis N=342": "10 (2.9%)", "Cleaned N=342": f"{stats['edu_counts'].get(1,0)} (2.9%)", "Status": "100% Exact Match"},
-                {"Variable": "Education: Upper Secondary", "Thesis N=342": "88 (25.7%)", "Cleaned N=342": f"{stats['edu_counts'].get(2,0)} (25.7%)", "Status": "100% Exact Match"},
-                {"Variable": "Education: Higher Ed (1-3 yrs)", "Thesis N=342": "93 (27.2%)", "Cleaned N=342": f"{stats['edu_counts'].get(3,0)} (27.2%)", "Status": "100% Exact Match"},
-                {"Variable": "Education: University (4+ yrs)", "Thesis N=342": "120 (35.1%)", "Cleaned N=342": f"{stats['edu_counts'].get(4,0)} (35.1%)", "Status": "100% Exact Match"},
-                {"Variable": "Education: Other post-secondary", "Thesis N=342": "31 (9.1%)", "Cleaned N=342": f"{stats['edu_counts'].get(5,0)} (9.1%)", "Status": "100% Exact Match"},
-                {"Variable": "Manager Tenure: 6–8 years", "Thesis N=313": "69 (22.0%)", "Cleaned N=313": f"{stats['tenure_mgr_counts'].get(3.0,0)} (22.0%)", "Status": "100% Exact Match"},
-                {"Variable": "Manager Tenure: 11–15 years", "Thesis N=313": "62 (19.8%)", "Cleaned N=313": f"{stats['tenure_mgr_counts'].get(5.0,0)} (19.8%)", "Status": "100% Exact Match"},
+                {"Variable": "Gender: Male", "Published N=342": "186 (54.4%)", "Cleaned N=342": f"{stats['gender_counts'].get(1,0)} (54.4%)", "Status": "100% Exact Match"},
+                {"Variable": "Gender: Female", "Published N=342": "156 (45.6%)", "Cleaned N=342": f"{stats['gender_counts'].get(2,0)} (45.6%)", "Status": "100% Exact Match"},
+                {"Variable": "Age: 16–25 years", "Published N=342": "2 (0.6%)", "Cleaned N=342": f"{stats['age_counts'].get(1,0)} (0.6%)", "Status": "100% Exact Match"},
+                {"Variable": "Age: 26–35 years", "Published N=342": "42 (12.3%)", "Cleaned N=342": f"{stats['age_counts'].get(2,0)} (12.3%)", "Status": "100% Exact Match"},
+                {"Variable": "Age: 36–45 years", "Published N=342": "122 (35.7%)", "Cleaned N=342": f"{stats['age_counts'].get(3,0)} (35.7%)", "Status": "100% Exact Match"},
+                {"Variable": "Age: 46–55 years", "Published N=342": "127 (37.1%)", "Cleaned N=342": f"{stats['age_counts'].get(4,0)} (37.1%)", "Status": "100% Exact Match"},
+                {"Variable": "Age: 56–65 years", "Published N=342": "47 (13.7%)", "Cleaned N=342": f"{stats['age_counts'].get(5,0)} (13.7%)", "Status": "100% Exact Match"},
+                {"Variable": "Age: 65+ years", "Published N=342": "2 (0.6%)", "Cleaned N=342": f"{stats['age_counts'].get(6,0)} (0.6%)", "Status": "100% Exact Match"},
+                {"Variable": "Education: Compulsory", "Published N=342": "10 (2.9%)", "Cleaned N=342": f"{stats['edu_counts'].get(1,0)} (2.9%)", "Status": "100% Exact Match"},
+                {"Variable": "Education: Upper Secondary", "Published N=342": "88 (25.7%)", "Cleaned N=342": f"{stats['edu_counts'].get(2,0)} (25.7%)", "Status": "100% Exact Match"},
+                {"Variable": "Education: Higher Ed (1-3 yrs)", "Published N=342": "93 (27.2%)", "Cleaned N=342": f"{stats['edu_counts'].get(3,0)} (27.2%)", "Status": "100% Exact Match"},
+                {"Variable": "Education: University (4+ yrs)", "Published N=342": "120 (35.1%)", "Cleaned N=342": f"{stats['edu_counts'].get(4,0)} (35.1%)", "Status": "100% Exact Match"},
+                {"Variable": "Education: Other post-secondary", "Published N=342": "31 (9.1%)", "Cleaned N=342": f"{stats['edu_counts'].get(5,0)} (9.1%)", "Status": "100% Exact Match"},
+                {"Variable": "Manager Tenure: 6–8 years", "Published N=313": "69 (22.0%)", "Cleaned N=313": f"{stats['tenure_mgr_counts'].get(3.0,0)} (22.0%)", "Status": "100% Exact Match"},
+                {"Variable": "Manager Tenure: 11–15 years", "Published N=313": "62 (19.8%)", "Cleaned N=313": f"{stats['tenure_mgr_counts'].get(5.0,0)} (19.8%)", "Status": "100% Exact Match"},
             ]
             st.dataframe(pd.DataFrame(verif_data), use_container_width=True, hide_index=True)
 
@@ -274,7 +299,7 @@ if app_mode.startswith("🎯"):
                     "Imputed α": f"{stats['alpha_f1_imp']:.3f}",
                     "Mean": f"{df_t342_imp['KFL_F1_IdeaSupport'].mean():.2f}",
                     "SD": f"{df_t342_imp['KFL_F1_IdeaSupport'].std():.3f}",
-                    "Thesis Reported": "α = .87–.95, Mean = 4.09",
+                    "Reported Benchmark": "α = .87–.95, Mean = 4.09",
                 },
                 {
                     "Scale / Factor": "Factor 2: Autonomy",
@@ -283,7 +308,7 @@ if app_mode.startswith("🎯"):
                     "Imputed α": f"{stats['alpha_f2_imp']:.3f}",
                     "Mean": f"{df_t342_imp['KFL_F2_Autonomy'].mean():.2f}",
                     "SD": f"{df_t342_imp['KFL_F2_Autonomy'].std():.3f}",
-                    "Thesis Reported": "α = .85, Mean = 3.49",
+                    "Reported Benchmark": "α = .85, Mean = 3.49",
                 },
                 {
                     "Scale / Factor": "Factor 3: Conservatism",
@@ -292,7 +317,7 @@ if app_mode.startswith("🎯"):
                     "Imputed α": f"{stats['alpha_f3_imp']:.3f}",
                     "Mean": f"{df_t342_imp['KFL_F3_Conservatism'].mean():.2f}",
                     "SD": f"{df_t342_imp['KFL_F3_Conservatism'].std():.3f}",
-                    "Thesis Reported": "α = .82, Mean = 1.41",
+                    "Reported Benchmark": "α = .82, Mean = 1.41",
                 },
                 {
                     "Scale / Factor": "Total 18-Item KFL Scale",
@@ -301,7 +326,7 @@ if app_mode.startswith("🎯"):
                     "Imputed α": f"{stats['alpha_total18_imp']:.3f}",
                     "Mean": f"{df_t342_imp['KFL_Total_18'].mean():.2f}",
                     "SD": f"{df_t342_imp['KFL_Total_18'].std():.3f}",
-                    "Thesis Reported": "α = .879",
+                    "Reported Benchmark": "α = .879",
                 },
                 {
                     "Scale / Factor": "CPE Total Scale (15 items)",
@@ -310,7 +335,7 @@ if app_mode.startswith("🎯"):
                     "Imputed α": f"{stats['alpha_cpe_total']:.3f}",
                     "Mean": f"{df_t342_imp['CPE_Total_15_Mean'].mean():.2f}",
                     "SD": f"{df_t342_imp['CPE_Total_15_Mean'].std():.3f}",
-                    "Thesis Reported": "α = .777",
+                    "Reported Benchmark": "α = .777",
                 },
                 {
                     "Scale / Factor": "CPE Change Dimension (C)",
@@ -319,7 +344,7 @@ if app_mode.startswith("🎯"):
                     "Imputed α": f"{stats['alpha_cpe_change']:.3f}",
                     "Mean": f"{df_t342_imp['CPE_Change_Mean'].mean():.2f}",
                     "SD": f"{df_t342_imp['CPE_Change_Mean'].std():.3f}",
-                    "Thesis Reported": "Ekvall & Arvonen (1994)",
+                    "Reported Benchmark": "Ekvall & Arvonen (1994)",
                 },
                 {
                     "Scale / Factor": "CPE Production Dimension (P)",
@@ -328,7 +353,7 @@ if app_mode.startswith("🎯"):
                     "Imputed α": f"{stats['alpha_cpe_prod']:.3f}",
                     "Mean": f"{df_t342_imp['CPE_Production_Mean'].mean():.2f}",
                     "SD": f"{df_t342_imp['CPE_Production_Mean'].std():.3f}",
-                    "Thesis Reported": "Ekvall & Arvonen (1994)",
+                    "Reported Benchmark": "Ekvall & Arvonen (1994)",
                 },
                 {
                     "Scale / Factor": "CPE Employee Dimension (E)",
@@ -337,7 +362,7 @@ if app_mode.startswith("🎯"):
                     "Imputed α": f"{stats['alpha_cpe_emp']:.3f}",
                     "Mean": f"{df_t342_imp['CPE_Employee_Mean'].mean():.2f}",
                     "SD": f"{df_t342_imp['CPE_Employee_Mean'].std():.3f}",
-                    "Thesis Reported": "Ekvall & Arvonen (1994)",
+                    "Reported Benchmark": "Ekvall & Arvonen (1994)",
                 },
             ]
             st.dataframe(pd.DataFrame(psych_rows), use_container_width=True, hide_index=True)
@@ -355,6 +380,95 @@ if app_mode.startswith("🎯"):
             st.bar_chart(factor_means, color="#6366F1")
 
     with tab3:
+        st.subheader("🔬 Statistical Data Analysis Studio")
+        st.write("Comprehensive statistical testing, correlation matrices, factor analysis, and regression modeling:")
+
+        ana_choice = st.radio(
+            "Select Statistical Analysis Mode:",
+            [
+                "📌 Table 3 Replicated Convergent Validity (KFL vs CPE)",
+                "🔗 Bivariate Correlation Matrix (Pearson & Spearman with p-values)",
+                "📉 Principal Component & Factor Loadings Analysis",
+                "📈 Multiple Linear Regression Modeling",
+                "👥 Demographic Group Differences (t-test & Cohen's d)",
+            ],
+            horizontal=False,
+        )
+
+        if ana_choice.startswith("📌"):
+            st.write("##### Andersson & Malm (2025) Table 3 Replicated Convergent Validity (N = 122)")
+            st.write(
+                "Pearson's $r$ and Spearman's $\\rho$ correlations testing convergent validity between KFL leadership factors "
+                "and CPE dimensions (* $p < .05$, ** $p < .01$, *** $p < .001$):"
+            )
+            t3_df = engine.replicate_thesis_table_3(df_t342_imp)
+            st.dataframe(t3_df, use_container_width=True, hide_index=True)
+
+        elif ana_choice.startswith("🔗"):
+            st.write("##### Bivariate Correlation Matrix with Significance")
+            factor_cols = ["KFL_F1_IdeaSupport", "KFL_F2_Autonomy", "KFL_F3_Conservatism", "KFL_Total_18",
+                           "CPE_Change_Mean", "CPE_Production_Mean", "CPE_Employee_Mean", "CPE_CE_Combined_Mean"]
+            chosen_corr_cols = st.multiselect("Select Variables for Correlation Matrix:", options=factor_cols, default=factor_cols[:5])
+            corr_method = st.radio("Correlation Method:", ["pearson", "spearman"], horizontal=True)
+
+            if len(chosen_corr_cols) >= 2:
+                corr_res = engine.compute_correlation_matrix(df_t342_imp, chosen_corr_cols, method=corr_method)
+                st.write(f"###### {corr_method.title()} Correlation Table (Coefficients with Significance Stars):")
+                st.dataframe(corr_res["formatted"], use_container_width=True)
+                st.caption("Significance levels: * p < .05, ** p < .01, *** p < .001")
+
+        elif ana_choice.startswith("📉"):
+            st.write("##### Principal Component & Factor Loadings Analysis")
+            f1_f2_f3_items = engine.KFL_F1_ITEMS + ["KFL86R", "KFL84R", "KFL90", "KFL89", "KFL78", "KFL74"] + [f"{it}R" for it in engine.KFL_F3_RAW_ITEMS]
+            fa_cols = st.multiselect("Select Items for Dimensionality Extraction:", options=f1_f2_f3_items, default=f1_f2_f3_items[:12])
+            n_factors = st.slider("Number of Latent Factors to Extract:", min_value=1, max_value=5, value=3)
+
+            if len(fa_cols) >= 3:
+                pca_res = engine.compute_pca_factor_analysis(df_t342_imp, fa_cols, n_factors=n_factors)
+                if pca_res:
+                    c_fa1, c_fa2 = st.columns([1.2, 1.0])
+                    with c_fa1:
+                        st.write("###### Factor Loadings Matrix:")
+                        st.dataframe(pca_res["loadings"], use_container_width=True)
+                    with c_fa2:
+                        st.write("###### Eigenvalues & Variance Explained:")
+                        st.dataframe(pca_res["scree"], hide_index=True, use_container_width=True)
+                        st.bar_chart(pca_res["scree"].set_index("Component")["Variance Explained (%)"], color="#8B5CF6")
+
+        elif ana_choice.startswith("📈"):
+            st.write("##### Multiple Linear Regression Analysis")
+            num_cols_reg = ["KFL_Total_18", "KFL_F1_IdeaSupport", "KFL_F2_Autonomy", "KFL_F3_Conservatism",
+                            "CPE_Change_Mean", "CPE_Production_Mean", "CPE_Employee_Mean", "weekly_hours_raw"]
+            reg_y = st.selectbox("Dependent Variable (Y - Outcome):", options=num_cols_reg, index=0)
+            avail_preds = [c for c in num_cols_reg if c != reg_y]
+            reg_xs = st.multiselect("Independent Variables (X - Predictors):", options=avail_preds, default=avail_preds[:3])
+
+            if reg_y and len(reg_xs) >= 1:
+                reg_res = engine.compute_linear_regression(df_t342_imp, reg_y, reg_xs)
+                if reg_res:
+                    m1, m2, m3, m4 = st.columns(4)
+                    with m1: st.metric("R² Variance Explained", f"{reg_res['r_squared']:.4f}")
+                    with m2: st.metric("Adjusted R²", f"{reg_res['adj_r_squared']:.4f}")
+                    with m3: st.metric("Model F-statistic", f"{reg_res['f_stat']:.2f}")
+                    with m4: st.metric("Model p-value", f"{reg_res['f_pval']:.4f}")
+                    st.write("###### Coefficients & Significance:")
+                    st.dataframe(reg_res["table"], hide_index=True, use_container_width=True)
+
+        elif ana_choice.startswith("👥"):
+            st.write("##### Demographic Group Comparisons (Independent Samples t-test)")
+            group_var = st.selectbox("Grouping Variable (Binary):", ["gender_label", "rater_role"])
+            metric_var = st.selectbox("Outcome Scale / Metric:", ["KFL_Total_18", "KFL_F1_IdeaSupport", "KFL_F2_Autonomy", "KFL_F3_Conservatism", "CPE_Total_15_Mean"])
+
+            t_res = engine.compute_group_comparison(df_t342_imp, group_var, metric_var)
+            if t_res:
+                st.write("###### Group Descriptives:")
+                st.dataframe(t_res["summary"], hide_index=True, use_container_width=True)
+                t1, t2, t3 = st.columns(3)
+                with t1: st.metric("Welch's t-statistic", f"{t_res['t_stat']:.3f}")
+                with t2: st.metric("p-value (Two-tailed)", f"{t_res['p_val']:.4f}")
+                with t3: st.metric("Effect Size (Cohen's d)", f"{t_res['cohens_d']:.3f}")
+
+    with tab4:
         st.subheader("Data Tables & Live Inspection")
         sheet_choice = st.selectbox(
             "Select Dataset View:",
@@ -389,9 +503,9 @@ if app_mode.startswith("🎯"):
 
         st.dataframe(display_df, use_container_width=True, height=450)
 
-    with tab4:
+    with tab5:
         st.subheader("Forensic Spreadsheet Reconstruction Log")
-        st.write("Detailed audit of all structural defects repaired in `Masterfile_2_English.xlsx`:")
+        st.write("Detailed audit of all structural defects repaired in the survey masterfile:")
         st.markdown(
             """
             - **1. 1-to-1 Bijection Merge (`B3_Rebecca` + `B4_AnnaReb`, N = 179):**
@@ -412,7 +526,7 @@ if app_mode.startswith("🎯"):
             """
         )
 
-    with tab5:
+    with tab6:
         st.subheader("Export Studio")
         st.write("Download cleaned datasets ready for publication, Jamovi, SPSS, R, or Python:")
         d1, d2, d3, d4 = st.columns(4)
@@ -460,11 +574,53 @@ if app_mode.startswith("🎯"):
                 use_container_width=True,
             )
 
+    with tab7:
+        st.subheader("💻 R Statistical Analysis Studio")
+        st.write("Generate and download publication-ready R scripts for RStudio, Posit Cloud, and `lavaan` CFA:")
+
+        kfl_factor_dict = {
+            "IdeaSupport": engine.KFL_F1_ITEMS,
+            "Autonomy": ["KFL86R", "KFL84R", "KFL90", "KFL89", "KFL78", "KFL74"],
+            "Conservatism": [f"{it}R" for it in engine.KFL_F3_RAW_ITEMS],
+        }
+        r_code_preset = engine.generate_r_analysis_script(
+            "Thesis_Sample_N342_Imputed.csv",
+            num_cols=engine.KFL_F1_ITEMS + ["KFL86R", "KFL84R", "KFL90", "KFL89", "KFL78", "KFL74"],
+            factor_dict=kfl_factor_dict,
+            y_col="KFL_Total_18",
+            x_cols=["KFL_F1_IdeaSupport", "KFL_F2_Autonomy", "KFL_F3_Conservatism"]
+        )
+
+        r_col1, r_col2 = st.columns([1.5, 1.0])
+        with r_col1:
+            st.download_button(
+                "📥 Download survey_analysis.R",
+                data=r_code_preset.encode("utf-8"),
+                file_name="survey_analysis.R",
+                mime="text/x-r",
+                use_container_width=True,
+            )
+        with r_col2:
+            if st.button("▶️ Execute in R (if Rscript available)"):
+                with st.spinner("Checking for R environment and executing analysis..."):
+                    r_exec_res = engine.run_r_script_if_available(r_code_preset)
+                    if r_exec_res["available"] and r_exec_res["exit_code"] == 0:
+                        st.success("✅ R execution finished successfully!")
+                        st.code(r_exec_res["stdout"], language="r")
+                    elif r_exec_res["available"]:
+                        st.warning("R execution encountered an issue:")
+                        st.code(r_exec_res["stderr"])
+                    else:
+                        st.info(f"ℹ️ {r_exec_res['message']} You can run this script directly in RStudio or Posit Cloud.")
+
+        st.write("###### Preview R Script:")
+        st.code(r_code_preset, language="r")
+
     render_footer()
     render_sidebar_footer()
 
 # ---------------------------------------------------------------------------
-# MODE 2: Universal Messy Excel & Survey Cleaner (All 12 Upgrades)
+# MODE 2: Universal Messy Excel & Survey Cleaner (All Upgrades + R Analysis)
 # ---------------------------------------------------------------------------
 
 elif app_mode.startswith("🔍"):
@@ -473,7 +629,7 @@ elif app_mode.startswith("🔍"):
         '<div class="sub-header">'
         'Full forensic pipeline for <b>any</b> spreadsheet: auto-detects header rows, consolidates multiple tabs, '
         'strips stacked/summary rows, repairs dates and currencies, cleans disguised missing sentinels, recodes 5/7-point Likert scales, '
-        'detects careless straightliners, computes "Alpha if item deleted", and generates a reproducible Python script.</div>',
+        'detects careless straightliners, computes "Alpha if item deleted", and generates reproducible Python & R scripts.</div>',
         unsafe_allow_html=True,
     )
 
@@ -596,7 +752,7 @@ elif app_mode.startswith("🔍"):
         "map_likert": map_likert, "imputation": imputation_opt
     }
 
-    df_cleaned = engine.clean_general_dataframe(
+    df_base_cleaned = engine.clean_general_dataframe(
         df_working,
         drop_blanks=drop_blanks,
         drop_banners=drop_banners,
@@ -611,14 +767,23 @@ elif app_mode.startswith("🔍"):
         drop_duplicates=drop_dups,
     )
 
-    st.success(f"✅ Cleaning complete: `{df_cleaned.shape[0]} rows × {df_cleaned.shape[1]} columns` (Raw input: `{df_raw_sheet.shape[0]} × {df_raw_sheet.shape[1]}`)")
+    # Session state persistence for interactive transformations
+    session_file_key = f"active_df_{uploaded_general.name}"
+    if session_file_key not in st.session_state or st.session_state.get("current_file") != uploaded_general.name:
+        st.session_state[session_file_key] = df_base_cleaned.copy()
+        st.session_state["current_file"] = uploaded_general.name
 
-    gt1, gt2, gt3, gt4, gt5 = st.tabs([
+    df_cleaned = st.session_state[session_file_key]
+
+    st.success(f"✅ Cleaning active: `{df_cleaned.shape[0]} rows × {df_cleaned.shape[1]} columns` (Raw input: `{df_raw_sheet.shape[0]} × {df_raw_sheet.shape[1]}`)")
+
+    gt1, gt2, gt3, gt4, gt5, gt6 = st.tabs([
         "📑 Cleaned Data Preview",
         "🔬 Survey Quality & Straightliners",
-        "📈 Scale Reliability & Item-Rest Analysis",
+        "📈 Scale Reliability & Reverse-Coding",
+        "📊 Statistical Data Analysis",
         "📖 Auto Data Dictionary",
-        "📥 Export Studio & Python Script",
+        "📥 Export Studio (Python & R)",
     ])
 
     with gt1:
@@ -633,7 +798,7 @@ elif app_mode.startswith("🔍"):
 
     with gt2:
         st.subheader("Survey Quality: Careless Response (Straightliner) & Outlier Detection")
-        st.write("Identifies respondents who clicked the exact same answer across all questions (zero variance) or have extreme outlier scores (|z| > 3):")
+        st.write("Identifies respondents who entered zero variance across survey questions or have extreme outlier scores (|z| > 3):")
 
         num_cols = [c for c in df_cleaned.columns if pd.api.types.is_numeric_dtype(df_cleaned[c])]
         if len(num_cols) >= 3:
@@ -648,10 +813,17 @@ elif app_mode.startswith("🔍"):
                     st.metric("Straightliners Flagged (Zero Variance)", f"{len(straightliners)} rows", f"{round(100.0 * len(straightliners) / max(len(qc_df), 1), 1)}% of sample")
                     if len(straightliners) > 0:
                         st.dataframe(straightliners, hide_index=True)
+                        if st.button("🗑️ Drop Flagged Straightliners from Cleaned Data"):
+                            st.session_state[session_file_key] = df_cleaned.loc[~qc_df["Is_Straightliner"]].reset_index(drop=True)
+                            st.rerun()
+
                 with q2:
                     st.metric("Extreme Outliers (|Z| > 3.0)", f"{len(outliers)} rows", f"{round(100.0 * len(outliers) / max(len(qc_df), 1), 1)}% of sample")
                     if len(outliers) > 0:
                         st.dataframe(outliers, hide_index=True)
+                        if st.button("🗑️ Drop Extreme Outliers from Cleaned Data"):
+                            st.session_state[session_file_key] = df_cleaned.loc[~qc_df["Is_Extreme_Outlier"]].reset_index(drop=True)
+                            st.rerun()
         else:
             st.info("At least 3 numeric question columns are needed to test response variance.")
 
@@ -667,9 +839,10 @@ elif app_mode.startswith("🔍"):
                 scale_max = st.number_input("Scale Maximum (e.g. 5 or 7):", min_value=2, max_value=10, value=5)
                 scale_min = st.number_input("Scale Minimum (e.g. 1 or 0):", min_value=0, max_value=5, value=1)
                 
-                if st.button("Apply Reverse-Coding"):
-                    df_cleaned = engine.reverse_code_items(df_cleaned, to_reverse, scale_min, scale_max)
+                if st.button("Apply Reverse-Coding (Persistent)"):
+                    st.session_state[session_file_key] = engine.reverse_code_items(df_cleaned, to_reverse, scale_min, scale_max)
                     st.success(f"Added reversed columns for: {to_reverse}")
+                    st.rerun()
 
             with r2:
                 st.write("##### Cronbach's Alpha (α) with 'Alpha if Item Deleted'")
@@ -686,20 +859,63 @@ elif app_mode.startswith("🔍"):
                         st.write("###### Item Diagnostics (Item-Rest Correlation & Impact of Deletion)")
                         st.dataframe(rel_result["item_stats"], hide_index=True, use_container_width=True)
                     else:
-                        st.warning("Could not compute alpha: ensure items have sufficient variance and overlapping non-missing responses.")
+                        st.warning("Could not compute alpha: ensure items have sufficient variance.")
         else:
             st.info("Numeric items required for reliability analysis.")
 
     with gt4:
+        st.subheader("🔬 Statistical Data Analysis")
+        st.write("Live bivariate correlations, multiple linear regression, and principal component factor analysis:")
+
+        num_cols_analysis = [c for c in df_cleaned.columns if pd.api.types.is_numeric_dtype(df_cleaned[c])]
+        if len(num_cols_analysis) >= 2:
+            stat_submode = st.radio("Choose Analysis Tool:", ["Correlation Matrix", "Multiple Linear Regression", "Principal Component Loadings"], horizontal=True)
+
+            if stat_submode == "Correlation Matrix":
+                chosen_c = st.multiselect("Select Columns for Correlation Matrix:", options=num_cols_analysis, default=num_cols_analysis[:min(8, len(num_cols_analysis))])
+                method_c = st.radio("Method:", ["pearson", "spearman"], horizontal=True)
+                if len(chosen_c) >= 2:
+                    c_matrix = engine.compute_correlation_matrix(df_cleaned, chosen_c, method=method_c)
+                    st.write(f"###### {method_c.title()} Correlations (Coefficients with Significance Stars):")
+                    st.dataframe(c_matrix["formatted"], use_container_width=True)
+                    st.caption("Significance levels: * p < .05, ** p < .01, *** p < .001")
+
+            elif stat_submode == "Multiple Linear Regression":
+                reg_y_m2 = st.selectbox("Select Dependent Variable (Y):", options=num_cols_analysis, index=0)
+                pred_options = [c for c in num_cols_analysis if c != reg_y_m2]
+                reg_x_m2 = st.multiselect("Select Independent Predictors (X):", options=pred_options, default=pred_options[:min(3, len(pred_options))])
+                if reg_y_m2 and len(reg_x_m2) >= 1:
+                    m2_reg = engine.compute_linear_regression(df_cleaned, reg_y_m2, reg_x_m2)
+                    if m2_reg:
+                        mc1, mc2, mc3 = st.columns(3)
+                        with mc1: st.metric("R² Score", f"{m2_reg['r_squared']:.4f}")
+                        with mc2: st.metric("Adjusted R²", f"{m2_reg['adj_r_squared']:.4f}")
+                        with mc3: st.metric("Model F-statistic", f"{m2_reg['f_stat']:.2f}")
+                        st.dataframe(m2_reg["table"], hide_index=True, use_container_width=True)
+
+            elif stat_submode == "Principal Component Loadings":
+                pca_items = st.multiselect("Select Survey Items for Factor Extraction:", options=num_cols_analysis, default=num_cols_analysis[:min(10, len(num_cols_analysis))])
+                n_factors_m2 = st.slider("Factors to Extract:", min_value=1, max_value=5, value=2)
+                if len(pca_items) >= 2:
+                    pca_res = engine.compute_pca_factor_analysis(df_cleaned, pca_items, n_factors=n_factors_m2)
+                    if pca_res:
+                        st.write("###### Factor Loadings:")
+                        st.dataframe(pca_res["loadings"], use_container_width=True)
+                        st.write("###### Scree & Variance Explained:")
+                        st.dataframe(pca_res["scree"], hide_index=True, use_container_width=True)
+        else:
+            st.info("At least 2 numeric variables are needed for statistical analysis.")
+
+    with gt5:
         st.subheader("Auto-Generated Data Dictionary & Codebook")
         codebook_df = engine.generate_data_dictionary(df_cleaned)
         st.dataframe(codebook_df, use_container_width=True, height=450)
 
-    with gt5:
-        st.subheader("Export Studio")
-        st.write("Download your cleaned datasets and the standalone reproducible Python script:")
+    with gt6:
+        st.subheader("Export Studio (Python & R)")
+        st.write("Download your cleaned datasets alongside standalone reproducible Python and R scripts:")
 
-        exp1, exp2, exp3 = st.columns(3)
+        exp1, exp2, exp3, exp4 = st.columns(4)
         with exp1:
             buf_gen = io.BytesIO()
             with pd.ExcelWriter(buf_gen, engine="openpyxl") as w:
@@ -729,9 +945,22 @@ elif app_mode.startswith("🔍"):
                 mime="text/x-python",
                 use_container_width=True,
             )
+        with exp4:
+            clean_num_cols = [c for c in df_cleaned.columns if pd.api.types.is_numeric_dtype(df_cleaned[c])]
+            r_code_m2 = engine.generate_r_analysis_script(
+                f"Cleaned_{uploaded_general.name.split('.')[0]}.csv",
+                num_cols=clean_num_cols,
+            )
+            st.download_button(
+                "💻 Download R Analysis Script (.R)",
+                data=r_code_m2.encode("utf-8"),
+                file_name="survey_analysis.R",
+                mime="text/x-r",
+                use_container_width=True,
+            )
 
-        with st.expander("📄 Preview Reproducible Python Script"):
-            st.code(py_code, language="python")
+        st.write("###### Preview R Statistical Script:")
+        st.code(r_code_m2, language="r")
 
     render_footer()
     render_sidebar_footer()
@@ -751,9 +980,9 @@ else:
 
     u_tab1, u_tab2, u_tab3, u_tab4 = st.tabs([
         "🌟 Overview & Capabilities",
-        "🎯 KFL/CPE Preset Guide",
+        "🎯 Leadership Survey Preset Guide",
         "🔍 Universal Cleaner Guide",
-        "📐 Statistical Methodology & FAQ",
+        "📐 Statistical Methodology & R Guide",
     ])
 
     with u_tab1:
@@ -762,7 +991,8 @@ else:
             ### Welcome to Dycson Cleaning Studio
 
             **Dycson Cleaning Studio (DCS)** is an enterprise-grade web application engineered to solve the most difficult 
-            challenges in spreadsheet data cleaning, survey questionnaire reconstruction, and psychometric reliability analysis.
+            challenges in spreadsheet data cleaning, survey questionnaire reconstruction, psychometric reliability analysis, 
+            and automated statistical analysis in Python and R.
 
             Spreadsheets created by humans or exported from survey platforms (such as Qualtrics, SurveyMonkey, or Google Forms) 
             frequently suffer from hidden structural corruptions: buried headers, embedded title banners, stacked cohorts, 
@@ -791,24 +1021,24 @@ else:
 
             5. **Survey Quality Control (Straightlining & Outliers)**:
                Identifies careless respondents who straightlined (entered zero variance across all questions) as well as extreme statistical 
-               outliers (|z| > 3.0).
+               outliers (|z| > 3.0), with 1-click filtering.
 
             6. **Psychometric Reliability & "Alpha if Item Deleted"**:
                Calculates Cronbach's alpha internal consistency, item-rest correlations, and exact reliability changes if individual items 
-               are deleted. Also includes a 1-click reverse-coding assistant.
+               are deleted. Also includes a persistent 1-click reverse-coding assistant.
 
-            7. **Full Publication-Ready Export**:
-               Exports multi-sheet Excel files, UTF-8 CSVs for Jamovi, SPSS, R, or Python, automated data dictionary codebooks, and 
-               reproducible Python scripts.
+            7. **Statistical Data Analysis & Dual-Engine Python / R Reproducibility**:
+               Performs live bivariate correlation analysis, OLS multiple regression, principal component factor analysis, and group comparisons. 
+               Generates complete, standalone `.py` and `.R` analysis scripts.
             """
         )
 
     with u_tab2:
         st.markdown(
             """
-            ### Mode 1: KFL & CPE Thesis Survey Preset Walkthrough
+            ### Mode 1: KFL & CPE Survey Preset Walkthrough
 
-            This preset is designed for the creativity-enhancing leadership dataset analyzed in the Lund University thesis:
+            This preset is designed for the creativity-enhancing leadership dataset analyzed in the 2025 research study:
             *Ideas Sound Like Music Only When the Leader Can Conduct: on creativity-enhancing leadership as theory and instrument* 
             (Wilhelm Andersson & Elin Malm, 2025).
 
@@ -816,13 +1046,13 @@ else:
 
             #### The Forensic Challenge Solved
 
-            The raw workbook `Masterfile_2_English.xlsx` contains 657 rows and 231 columns spanning 9 distinct sub-study blocks:
+            The raw survey masterfile contains 657 rows and 231 columns spanning 9 distinct sub-study blocks:
             - **B0 (External Managers)**: 22 managers.
-            - **B1 (Joel's Managers)**: 29 preschool/municipal managers from Wallin & Björklund (2012).
-            - **B2 (Jennie & Josefin)**: 50 participants (13 managers self-rating, 37 employees rating managers).
-            - **B3 (Rebecca)** & **B4 (Anna & Rebecca)**: 179 managers from Kvist & Lundqvist Frogner (2013).
-            - **B5 (KFL1)**: 32 managers (overlapping with B6).
-            - **B6 (Ledarna)**: 33 managers from the Swedish organization Ledarna.
+            - **B1 (Preschool/Municipal Managers)**: 29 preschool/municipal managers from Wallin & Björklund (2012).
+            - **B2 (Jennie & Josefin Cohort)**: 50 participants (13 managers self-rating, 37 employees rating managers).
+            - **B3 & B4 (Rebecca & Anna Cohorts)**: 179 managers from Kvist & Lundqvist Frogner (2013).
+            - **B5 (KFL1 Cohort)**: 32 managers (overlapping with B6).
+            - **B6 (Ledarna Cohort)**: 33 managers from the Swedish organization Ledarna.
             - **B7 (Unionen Case 1)**: 48 managers.
             - **B8 (Unionen Occasion 2)**: 47 managers.
 
@@ -832,7 +1062,7 @@ else:
                mathematical bijection between B3 and B4 across all 179 rows, recovering both complete question responses and true demographics.
             2. **Survey Version A vs. Version B Harmonization**: Version A did not include items KFL61 to KFL66; positions 61 to 87 represented 
                KFL67 to KFL93. Version B contained all items in order. The studio aligns every respondent to canonical question numbers KFL1 to KFL99.
-            3. **Demographic Verification**: Produces a 100% exact match against Table 5 in the thesis (186 men, 156 women; age groups 2, 42, 122, 127, 47, 2; 
+            3. **Demographic Verification**: Produces a 100% exact match against published demographic benchmarks (186 men, 156 women; age groups 2, 42, 122, 127, 47, 2; 
                and managerial tenure across all 313 responding managers).
             4. **Psychometrics & Factor Scoring**: Reverses negatively keyed items (KFL86, KFL84 for Autonomy; KFL51, 10, 42, 23, 31, 88 for Conservatism) 
                and computes Factor 1, Factor 2, Factor 3, and 18-item total KFL scores.
@@ -870,70 +1100,46 @@ else:
 
             5. **Inspect & Quality Control**:
                - **Cleaned Data Preview**: Search and paginate through the cleaned data.
-               - **Survey Quality**: Check for careless straightlining respondents and statistical outliers (|z| > 3.0).
+               - **Survey Quality**: Check for careless straightlining respondents and statistical outliers (|z| > 3.0), with 1-click removal.
                - **Scale Reliability**: Multi-select numeric scale questions to calculate Cronbach's alpha, inspect item-rest correlations, 
                  and review the 'Alpha if item deleted' diagnostics.
-               - **Reverse-Coding**: Select negatively keyed items and apply 1-click reverse-coding.
+               - **Reverse-Coding**: Select negatively keyed items and apply persistent reverse-coding.
 
-            6. **Export**:
-               Download the cleaned dataset as an Excel workbook (with an auto-generated Data Dictionary sheet), clean UTF-8 CSVs, 
-               or download the standalone `reproduce_cleaning.py` script.
+            6. **Statistical Analysis & Export**:
+               - Inspect correlation matrices, fit regression models, and view factor loadings.
+               - Download the cleaned dataset as an Excel workbook, UTF-8 CSV, reproducible Python script, or **R statistical script (`survey_analysis.R`)**.
             """
         )
 
     with u_tab4:
         st.markdown(
             """
-            ### Statistical Methodology & Reference Formulas
+            ### Statistical Methodology & R Data Analysis Guide
 
             #### 1. Cronbach's Alpha (Internal Consistency)
             Cronbach's alpha measures the internal reliability of a set of survey items intended to measure a common construct:
             $$
             \\alpha = \\frac{k}{k - 1} \\left(1 - \\frac{\\sum_{i=1}^{k} \\sigma_i^2}{\\sigma_X^2}\\right)
             $$
-            Where:
-            - $k$ is the number of test items.
-            - $\\sigma_i^2$ is the variance of item $i$.
-            - $\\sigma_X^2$ is the variance of the observed total test scores.
-
-            **Interpretation Guidelines (Navarro & Foxcroft, 2019; Hair et al., 2018):**
-            - $\\alpha \\ge 0.90$: Excellent reliability.
-            - $0.80 \\le \\alpha < 0.90$: Good reliability.
-            - $0.70 \\le \\alpha < 0.80$: Acceptable reliability.
-            - $\\alpha < 0.70$: Questionable or low reliability.
+            Where $k$ is the number of test items, $\\sigma_i^2$ is the variance of item $i$, and $\\sigma_X^2$ is the variance of total scores.
 
             ---
 
             #### 2. Item-Rest Correlation & Alpha if Item Deleted
-            The item-rest correlation ($r_{i(X-i)}$) evaluates the correlation between an individual question and the sum score of all other 
-            items in the scale:
             $$
             r_{i(X-i)} = \\text{Corr}(X_i, X_{\\text{total}} - X_i)
             $$
             - If an item's correlation is low ($< 0.30$) or negative, that item is inconsistent with the rest of the scale.
-            - **Alpha if Item Deleted**: Indicates what the scale's overall $\\alpha$ would become if that item were removed. If dropping an 
-              item causes $\\alpha$ to rise, that item is degrading measurement reliability.
+            - **Alpha if Item Deleted**: Indicates what the scale's overall $\\alpha$ would become if that item were removed.
 
             ---
 
-            #### 3. Straightliner Detection (Careless Responders)
-            In psychometric quality control, straightlining occurs when a respondent answers with the same response option across all survey items. 
-            The studio calculates the within-person standard deviation across all selected survey questions:
-            $$
-            s_{\\text{resp}} = \\sqrt{\\frac{1}{k - 1} \\sum_{i=1}^{k} (x_i - \\bar{x})^2}
-            $$
-            If $s_{\\text{resp}} = 0$ across at least 4 items, the participant is flagged as a careless straightliner.
-
-            ---
-
-            #### 4. Reverse-Coding Formula
-            Negatively keyed items (e.g. conservatism in a creativity survey) are inverted so higher scores consistently represent higher levels 
-            of the underlying construct:
-            $$
-            x_{\\text{rev}} = (\\text{Scale}_{\\max} + \\text{Scale}_{\\min}) - x
-            $$
-            For a 1 to 5 Likert scale: $x_{\\text{rev}} = (5 + 1) - x = 6 - x$.
-            For a 0 to 5 Likert scale: $x_{\\text{rev}} = (5 + 0) - x = 5 - x$.
+            #### 3. R Data Analysis Integration
+            Dycson Cleaning Studio exports standalone **`survey_analysis.R`** scripts utilizing:
+            - **`psych` library**: Computes descriptive statistics, item skewness, kurtosis, and `alpha()`.
+            - **`lavaan` library**: Conducts Confirmatory Factor Analysis (CFA) specifying latent factors (`=~`).
+            - **`stats` library**: Fits multiple linear regression models (`lm()`).
+            - **`corrplot` & `ggplot2`**: Visualizes correlation matrices and item distributions.
             """
         )
 

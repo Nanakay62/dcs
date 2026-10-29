@@ -2,9 +2,9 @@
 clean_masterfile.py
 ===================
 Comprehensive data-cleaning, schema-harmonization, and psychometric validation pipeline
-for `Masterfile_2_English.xlsx` (accompanying the Lund University psychology thesis by
-Wilhelm Andersson & Elin Malm, 2025: "Ideas Sound Like Music Only When the Leader Can Conduct:
-on creativity-enhancing leadership as theory and instrument").
+accompanying the psychology research study by Wilhelm Andersson & Elin Malm (2025):
+"Ideas Sound Like Music Only When the Leader Can Conduct: on creativity-enhancing
+leadership as theory and instrument".
 
 Outputs generated in `c:\\Users\\nanak\\Desktop\\mawuse assignment\\`:
 1. `Masterfile_Cleaned.xlsx` (multi-sheet workbook):
