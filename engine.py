@@ -923,27 +923,66 @@ def compute_linear_regression(df, y_col, x_cols):
 def compute_pca_factor_analysis(df, cols, n_factors=3):
     """
     Computes Principal Component / Factor loadings and explained variance.
+    Uses SVD on standardized data for numerical stability, handles singular/collinear matrices,
+    and isolates zero-variance (constant) variables.
     """
-    clean = df[cols].apply(pd.to_numeric, errors='coerce').dropna()
-    if len(clean) < 5 or len(cols) < 2:
+    if not cols or len(cols) < 2:
         return None
 
-    corr_mat = clean.corr().values
-    eigvals, eigvecs = np.linalg.eigh(corr_mat)
+    clean = df[cols].apply(pd.to_numeric, errors='coerce').dropna()
+    if len(clean) < 3:
+        return None
 
-    idx = np.argsort(eigvals)[::-1]
-    eigvals = eigvals[idx]
-    eigvecs = eigvecs[:, idx]
+    # Identify and isolate constant / zero-variance variables
+    valid_cols = [c for c in cols if clean[c].std(ddof=1) > 0 and clean[c].nunique() > 1]
+    zero_var_cols = [c for c in cols if c not in valid_cols]
 
-    n_comps = min(n_factors, len(cols))
-    var_explained = (eigvals[:n_comps] / len(cols)) * 100.0
+    if len(valid_cols) < 2:
+        return {
+            "error": f"The selected items {zero_var_cols} have zero variance (all respondents entered identical values). Factor extraction requires at least 2 variables with response variance.",
+            "zero_var_cols": zero_var_cols,
+        }
+
+    # Standardize valid columns (Z = (X - mean) / std)
+    clean_valid = clean[valid_cols]
+    std_devs = clean_valid.std(ddof=1)
+    std_devs = std_devs.replace(0, 1.0)
+    Z = (clean_valid - clean_valid.mean()) / std_devs
+    Z = Z.fillna(0.0)
+
+    n_samples = len(Z)
+    k_vars = len(valid_cols)
+
+    try:
+        # SVD on scaled data matrix: Z / sqrt(n - 1)
+        # S^2 corresponds to the eigenvalues of the correlation matrix
+        U, S, Vt = np.linalg.svd(Z.values / np.sqrt(max(n_samples - 1, 1)), full_matrices=False)
+        eigvals = S ** 2
+    except Exception:
+        try:
+            corr_mat = np.nan_to_num(clean_valid.corr().values, nan=0.0)
+            corr_mat = (corr_mat + corr_mat.T) / 2.0
+            np.fill_diagonal(corr_mat, 1.0)
+            eigvals, eigvecs = np.linalg.eigh(corr_mat)
+            idx = np.argsort(eigvals)[::-1]
+            eigvals = np.maximum(0, eigvals[idx])
+            Vt = eigvecs[:, idx].T
+        except Exception:
+            return None
+
+    n_comps = min(int(n_factors), k_vars, len(eigvals))
+    if n_comps < 1:
+        return None
+
+    var_explained = (eigvals[:n_comps] / k_vars) * 100.0
     cum_var = np.cumsum(var_explained)
 
-    loadings = eigvecs[:, :n_comps] * np.sqrt(np.maximum(0, eigvals[:n_comps]))
+    # Component loadings: eigenvector * sqrt(eigenvalue)
+    loadings = Vt[:n_comps, :].T * np.sqrt(np.maximum(0, eigvals[:n_comps]))
 
     loadings_df = pd.DataFrame(
         loadings.round(3),
-        index=cols,
+        index=valid_cols,
         columns=[f"Factor {i+1}" for i in range(n_comps)]
     )
 
@@ -954,10 +993,20 @@ def compute_pca_factor_analysis(df, cols, n_factors=3):
         "Cumulative Variance (%)": cum_var.round(1),
     })
 
+    warning_msg = None
+    if zero_var_cols:
+        warning_msg = (
+            f"ℹ️ **Constant Items Excluded**: {len(zero_var_cols)} variable(s) with zero response variance "
+            f"({', '.join(zero_var_cols)}) were excluded from factor extraction."
+        )
+
     return {
         "loadings": loadings_df,
         "scree": scree_df,
-        "n_obs": len(clean),
+        "n_obs": n_samples,
+        "k_items": k_vars,
+        "zero_var_cols": zero_var_cols,
+        "warning": warning_msg,
     }
 
 

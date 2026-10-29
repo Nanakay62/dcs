@@ -1091,10 +1091,17 @@ elif app_mode.startswith("🔍"):
                 if len(pca_items) >= 2:
                     pca_res = engine.compute_pca_factor_analysis(df_cleaned, pca_items, n_factors=n_factors_m2)
                     if pca_res:
-                        st.write("###### Factor Loadings:")
-                        st.dataframe(pca_res["loadings"], use_container_width=True)
-                        st.write("###### Scree & Variance Explained:")
-                        st.dataframe(pca_res["scree"], hide_index=True, use_container_width=True)
+                        if pca_res.get("error"):
+                            st.warning(pca_res["error"])
+                        else:
+                            if pca_res.get("warning"):
+                                st.info(pca_res["warning"])
+                            st.write("###### Factor Loadings:")
+                            st.dataframe(pca_res["loadings"], use_container_width=True)
+                            st.write("###### Scree & Variance Explained:")
+                            st.dataframe(pca_res["scree"], hide_index=True, use_container_width=True)
+                    else:
+                        st.warning("⚠️ Insufficient complete cases to extract factors. Please ensure items have at least 3 complete responses.")
         else:
             st.info("At least 2 numeric variables are needed for statistical analysis.")
 
