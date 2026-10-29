@@ -207,9 +207,10 @@ if app_mode.startswith("🎯"):
 
     with col_src2:
         imp_strategy = st.selectbox(
-            "Missing Data Imputation Strategy:",
-            ["median", "mean", "none"],
-            format_func=lambda x: "Column Median (Study Standard : Section 2.3)" if x == "median" else ("Column Mean" if x == "mean" else "None (Keep Raw NaNs)"),
+            "Missing Data Reporting & Imputation:",
+            ["none", "median", "mean"],
+            index=0,
+            format_func=lambda x: "None (Preserve Raw Missing / Non-Response - Audit Standard)" if x == "none" else ("Column Median (Historical Benchmark: Section 2.3)" if x == "median" else "Column Mean"),
         )
 
     df_raw = None
@@ -282,8 +283,9 @@ if app_mode.startswith("🎯"):
 
     st.write("")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab_nr, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "📊 Demographic Verification",
+        "📋 Non-Response & Missing Data Audit",
         "📈 Psychometrics & Reliability",
         "🔬 Statistical Data Analysis",
         "📑 Data Tables & Live Preview",
@@ -328,6 +330,41 @@ if app_mode.startswith("🎯"):
             st.write("##### Education Level Breakdown (N = 342)")
             edu_chart_df = df_t342["education_label"].value_counts().reindex(list(engine.EDU_LABELS.values())).fillna(0)
             st.bar_chart(edu_chart_df, color="#10B981")
+
+    with tab_nr:
+        st.subheader("📋 Non-Response & Missing Data Reporting Engine")
+        st.markdown(
+            """
+            > **🛡️ Survey Integrity Standard**:
+            > Missing data is **reported as observed**, never fabricated, hidden, or silently imputed.
+            > If 10 managers were surveyed and 5 answered, this platform reports:
+            > `5 valid responses out of 10 (50.0% response rate | 5 missing / not reported)`.
+            """
+        )
+        nr_report = engine.generate_non_response_audit_report(df_t342)
+        ov = nr_report["overview"]
+
+        c_nr1, c_nr2, c_nr3, c_nr4 = st.columns(4)
+        with c_nr1: st.metric("Cohort Sample Size (N)", f"{ov['total_respondents']}", "Total Surveyed")
+        with c_nr2: st.metric("Complete Respondents", f"{ov['complete_respondents']}", f"{round(100.0 * ov['complete_respondents'] / max(ov['total_respondents'], 1), 1)}% 100% complete")
+        with c_nr3: st.metric("Partial Non-Responses", f"{ov['partial_respondents']}", f"{ov['partial_respondents']} skipped items")
+        with c_nr4: st.metric("Overall Response Rate", f"{ov['overall_response_rate']}%", "Valid data cells")
+
+        st.write("##### Item-Level Response Rate & Non-Response Table")
+        st.caption("Reports exact valid responses out of the total surveyed cohort (e.g. '342 of 342 responded').")
+        st.dataframe(nr_report["item_audit"], use_container_width=True, hide_index=True)
+
+        st.write("##### Case-Level (Respondent) Completion Audit")
+        st.caption("Inspect questionnaire completion for each individual respondent.")
+        st.dataframe(nr_report["case_audit"], use_container_width=True, hide_index=True)
+
+        csv_nr = nr_report["item_audit"].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Download Non-Response & Missing Data Audit (CSV)",
+            data=csv_nr,
+            file_name="non_response_audit_report.csv",
+            mime="text/csv",
+        )
 
     with tab2:
         st.subheader("Psychometrics & Reliability Analysis")
@@ -460,6 +497,8 @@ if app_mode.startswith("🎯"):
                 st.write(f"###### {corr_method.title()} Correlation Table (Coefficients with Significance Stars):")
                 st.dataframe(corr_res["formatted"], use_container_width=True)
                 st.caption("Significance levels: * p < .05, ** p < .01, *** p < .001")
+                with st.expander("📊 View Pairwise Valid Sample Sizes (Valid Responses out of Total N)"):
+                    st.dataframe(corr_res["n_matrix"], use_container_width=True)
 
         elif ana_choice.startswith("📉"):
             st.write("##### Principal Component & Factor Loadings Analysis")
@@ -490,6 +529,7 @@ if app_mode.startswith("🎯"):
             if reg_y and len(reg_xs) >= 1:
                 reg_res = engine.compute_linear_regression(df_t342_imp, reg_y, reg_xs)
                 if reg_res:
+                    st.info(f"📊 **Sample Audit**: {reg_res['obs_summary']}")
                     m1, m2, m3, m4 = st.columns(4)
                     with m1: st.metric("R² Variance Explained", f"{reg_res['r_squared']:.4f}")
                     with m2: st.metric("Adjusted R²", f"{reg_res['adj_r_squared']:.4f}")
@@ -790,11 +830,12 @@ elif app_mode.startswith("🔍"):
         parse_numbers = st.checkbox("Clean currency, % and Euro decimals", value=True)
         map_likert = st.checkbox("Recode 5/7-point Likert scales (0..5/7)", value=True)
     with c_s4:
-        st.write("##### 4. Missing Value Strategy")
+        st.write("##### 4. Missing Data Strategy")
         imputation_opt = st.selectbox(
-            "Impute numeric missing data:",
+            "Missing Value Strategy:",
             ["none", "median", "mean"],
-            format_func=lambda x: "None (Keep NaNs)" if x == "none" else ("Column Median" if x == "median" else "Column Mean"),
+            index=0,
+            format_func=lambda x: "None (Preserve Raw Missing / Non-Response - Audit Standard)" if x == "none" else ("Column Median" if x == "median" else "Column Mean"),
         )
 
     cleaning_options = {
@@ -829,8 +870,9 @@ elif app_mode.startswith("🔍"):
 
     st.success(f"✅ Cleaning active: `{df_cleaned.shape[0]} rows × {df_cleaned.shape[1]} columns` (Raw input: `{df_raw_sheet.shape[0]} × {df_raw_sheet.shape[1]}`)")
 
-    gt1, gt2, gt3, gt4, gt5, gt6 = st.tabs([
+    gt1, gt_nr, gt2, gt3, gt4, gt5, gt6 = st.tabs([
         "📑 Cleaned Data Preview",
+        "📋 Non-Response & Missing Data Audit",
         "🔬 Survey Quality & Straightliners",
         "📈 Scale Reliability & Reverse-Coding",
         "📊 Statistical Data Analysis",
@@ -847,6 +889,42 @@ elif app_mode.startswith("🔍"):
         else:
             preview_df = df_cleaned
         st.dataframe(preview_df, use_container_width=True, height=450)
+
+    with gt_nr:
+        st.subheader("📋 Non-Response & Missing Data Reporting Engine")
+        st.markdown(
+            """
+            > **🛡️ Accurate Reporting Standard**:
+            > Missing data is **never cleaned, overwritten, or fabricated**. Non-responses are explicitly reported
+            > so that statistical conclusions remain valid and reproducible.
+            > If 10 participants were surveyed and only 5 responded, it is explicitly reported that there were:
+            > `5 valid responses out of 10 (50.0% response rate | 5 not reported)`.
+            """
+        )
+        nr_report_m2 = engine.generate_non_response_audit_report(df_cleaned)
+        ov_m2 = nr_report_m2["overview"]
+
+        c_nr1, c_nr2, c_nr3, c_nr4 = st.columns(4)
+        with c_nr1: st.metric("Total Sample Size (N)", f"{ov_m2['total_respondents']}", "Surveyed Participants")
+        with c_nr2: st.metric("Complete Respondents", f"{ov_m2['complete_respondents']}", f"{round(100.0 * ov_m2['complete_respondents'] / max(ov_m2['total_respondents'], 1), 1)}% 100% complete")
+        with c_nr3: st.metric("Partial Non-Responses", f"{ov_m2['partial_respondents']}", f"{ov_m2['partial_respondents']} skipped items")
+        with c_nr4: st.metric("Overall Response Rate", f"{ov_m2['overall_response_rate']}%", "Valid data cells")
+
+        st.write("##### Item-Level Response Rate & Non-Response Table")
+        st.caption("Reports exact valid responses out of total participants for every single question (e.g. '5 of 10 responded').")
+        st.dataframe(nr_report_m2["item_audit"], use_container_width=True, hide_index=True)
+
+        st.write("##### Case-Level (Respondent) Completion Audit")
+        st.caption("Inspect questionnaire completion for each individual respondent in the dataset.")
+        st.dataframe(nr_report_m2["case_audit"], use_container_width=True, hide_index=True)
+
+        csv_nr_m2 = nr_report_m2["item_audit"].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Download Non-Response & Missing Data Audit (CSV)",
+            data=csv_nr_m2,
+            file_name="non_response_audit_report.csv",
+            mime="text/csv",
+        )
 
     with gt2:
         st.subheader("Survey Quality: Careless Response (Straightliner) & Outlier Detection")
@@ -931,6 +1009,8 @@ elif app_mode.startswith("🔍"):
                     st.write(f"###### {method_c.title()} Correlations (Coefficients with Significance Stars):")
                     st.dataframe(c_matrix["formatted"], use_container_width=True)
                     st.caption("Significance levels: * p < .05, ** p < .01, *** p < .001")
+                    with st.expander("📊 View Pairwise Valid Sample Sizes (Valid Responses out of Total N)"):
+                        st.dataframe(c_matrix["n_matrix"], use_container_width=True)
 
             elif stat_submode == "Multiple Linear Regression":
                 reg_y_m2 = st.selectbox("Select Dependent Variable (Y):", options=num_cols_analysis, index=0)
@@ -939,6 +1019,7 @@ elif app_mode.startswith("🔍"):
                 if reg_y_m2 and len(reg_x_m2) >= 1:
                     m2_reg = engine.compute_linear_regression(df_cleaned, reg_y_m2, reg_x_m2)
                     if m2_reg:
+                        st.info(f"📊 **Sample Audit**: {m2_reg['obs_summary']}")
                         mc1, mc2, mc3 = st.columns(3)
                         with mc1: st.metric("R² Score", f"{m2_reg['r_squared']:.4f}")
                         with mc2: st.metric("Adjusted R²", f"{m2_reg['adj_r_squared']:.4f}")

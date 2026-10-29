@@ -736,22 +736,27 @@ def reverse_code_items(df, item_cols, scale_min=1, scale_max=5):
 
 def compute_correlation_matrix(df, cols, method="pearson"):
     """
-    Computes bivariate correlation matrix with p-values and significance stars.
+    Computes bivariate correlation matrix with p-values, significance stars,
+    and pairwise sample sizes (reporting valid responses out of total).
     """
     sub = df[cols].apply(pd.to_numeric, errors='coerce')
     corr_df = pd.DataFrame(index=cols, columns=cols, dtype=float)
     pval_df = pd.DataFrame(index=cols, columns=cols, dtype=float)
     stars_df = pd.DataFrame(index=cols, columns=cols, dtype=object)
+    n_matrix = pd.DataFrame(index=cols, columns=cols, dtype=object)
+    total_n = len(df)
 
     for c1 in cols:
         for c2 in cols:
             if c1 == c2:
                 r, p = 1.0, 0.0
+                n_pair = int(sub[c1].notna().sum())
             else:
                 v1 = sub[c1]
                 v2 = sub[c2]
                 mask = v1.notna() & v2.notna()
-                if mask.sum() < 3:
+                n_pair = int(mask.sum())
+                if n_pair < 3:
                     r, p = np.nan, np.nan
                 else:
                     if method == "spearman":
@@ -774,8 +779,9 @@ def compute_correlation_matrix(df, cols, method="pearson"):
             else:
                 stars = ""
             stars_df.loc[c1, c2] = f"{r:.3f}{stars}" if pd.notna(r) else "NaN"
+            n_matrix.loc[c1, c2] = f"{n_pair} / {total_n} valid"
 
-    return {"corr": corr_df, "pval": pval_df, "formatted": stars_df}
+    return {"corr": corr_df, "pval": pval_df, "formatted": stars_df, "n_matrix": n_matrix}
 
 
 def compute_linear_regression(df, y_col, x_cols):
@@ -826,8 +832,13 @@ def compute_linear_regression(df, y_col, x_cols):
         "Sig": ["***" if p < 0.001 else ("**" if p < 0.01 else ("*" if p < 0.05 else "")) for p in p_values]
     })
 
+    total_sample = len(df)
+    missing_count = total_sample - n
     return {
         "n_obs": n,
+        "n_total": total_sample,
+        "n_missing": missing_count,
+        "obs_summary": f"{n} valid responses out of {total_sample} ({missing_count} excluded due to missing data)",
         "r_squared": round(float(r_squared), 4),
         "adj_r_squared": round(float(adj_r_squared), 4),
         "f_stat": round(float(f_stat), 3) if pd.notna(f_stat) else np.nan,
@@ -1091,6 +1102,110 @@ def run_r_script_if_available(r_script_content, workdir=None):
 # ---------------------------------------------------------------------------
 # 6. Auto-Codebook & Reproducible Python Script Generation
 # ---------------------------------------------------------------------------
+
+def generate_non_response_audit_report(df):
+    """
+    Generates comprehensive item-level and case-level non-response & missing data audit.
+    Reports exact valid responses out of total (e.g. '5 valid responses out of 10'),
+    percentage response rate, and missing count.
+    """
+    total_rows = len(df)
+    total_cols = len(df.columns)
+
+    # 1. Item-Level Audit
+    item_rows = []
+    for col in df.columns:
+        s = df[col]
+        n_valid = int(s.notna().sum())
+        n_missing = int(s.isna().sum())
+        resp_rate = round(100.0 * n_valid / max(total_rows, 1), 1)
+        missing_rate = round(100.0 * n_missing / max(total_rows, 1), 1)
+
+        if n_missing == 0:
+            status = "🟢 Complete (100%)"
+        elif n_valid == 0:
+            status = "🔴 Zero Responses (100% Missing)"
+        elif resp_rate >= 80.0:
+            status = f"🟢 High Response ({resp_rate}%)"
+        elif resp_rate >= 50.0:
+            status = f"🟡 Moderate Response ({resp_rate}%)"
+        else:
+            status = f"🟠 Low Response ({resp_rate}%)"
+
+        item_rows.append({
+            "Variable / Question": col,
+            "Valid Responses": n_valid,
+            "Not Reported / Missing": n_missing,
+            "Total Surveyed": total_rows,
+            "Response Count Summary": f"{n_valid} of {total_rows} responded",
+            "Response Rate (%)": resp_rate,
+            "Missing Rate (%)": missing_rate,
+            "Data Quality Status": status,
+        })
+    df_items = pd.DataFrame(item_rows)
+
+    # 2. Case-Level (Respondent) Audit
+    case_rows = []
+    for idx in range(total_rows):
+        row = df.iloc[idx]
+        n_answered = int(row.notna().sum())
+        n_unanswered = int(row.isna().sum())
+        case_rate = round(100.0 * n_answered / max(total_cols, 1), 1)
+
+        if n_unanswered == 0:
+            pattern = "🟢 Complete (100%)"
+        elif n_answered == 0:
+            pattern = "🔴 Zero Responses (Dropped Out)"
+        elif case_rate >= 80.0:
+            pattern = f"🟢 High Completion ({case_rate}%)"
+        else:
+            pattern = f"🟡 Partial Non-Response ({case_rate}%)"
+
+        resp_label = f"Respondent #{idx + 1}"
+        for id_candidate in ["respondent_id", "Respondent_ID", "ID", "id", "Subject", "subject"]:
+            if id_candidate in df.columns and pd.notna(row[id_candidate]):
+                resp_label = str(row[id_candidate])
+                break
+
+        case_rows.append({
+            "Respondent": resp_label,
+            "Questions Answered": n_answered,
+            "Questions Skipped / Missing": n_unanswered,
+            "Total Questions": total_cols,
+            "Completion Summary": f"{n_answered} of {total_cols} answered",
+            "Completion Rate (%)": case_rate,
+            "Respondent Pattern": pattern,
+        })
+    df_cases = pd.DataFrame(case_rows)
+
+    # 3. Overall Matrix Summary
+    total_cells = total_rows * total_cols
+    total_valid_cells = int(df.notna().sum().sum())
+    total_missing_cells = total_cells - total_valid_cells
+    overall_response_rate = round(100.0 * total_valid_cells / max(total_cells, 1), 1)
+
+    complete_respondents = int((df.isna().sum(axis=1) == 0).sum())
+    partial_respondents = int(((df.isna().sum(axis=1) > 0) & (df.notna().sum(axis=1) > 0)).sum())
+    dropout_respondents = int((df.notna().sum(axis=1) == 0).sum())
+
+    overview = {
+        "total_respondents": total_rows,
+        "total_questions": total_cols,
+        "total_cells": total_cells,
+        "total_valid_cells": total_valid_cells,
+        "total_missing_cells": total_missing_cells,
+        "overall_response_rate": overall_response_rate,
+        "complete_respondents": complete_respondents,
+        "partial_respondents": partial_respondents,
+        "dropout_respondents": dropout_respondents,
+    }
+
+    return {
+        "item_audit": df_items,
+        "case_audit": df_cases,
+        "overview": overview,
+    }
+
 
 def generate_data_dictionary(df):
     """Generates comprehensive variable dictionary with summary metrics for every column."""
