@@ -142,7 +142,9 @@ NAV_MODES = [
     "🔍 Universal Messy Excel & Survey Cleaner",
     "📖 User Guide & Documentation",
 ]
-if "app_mode_nav" not in st.session_state:
+if "pending_mode_redirect" in st.session_state:
+    st.session_state["app_mode_nav"] = st.session_state.pop("pending_mode_redirect")
+elif "app_mode_nav" not in st.session_state:
     st.session_state["app_mode_nav"] = NAV_MODES[0]
 
 app_mode = st.sidebar.radio(
@@ -191,6 +193,15 @@ if app_mode.startswith("🎯"):
     st.subheader("📁 Dataset Selection & Upload")
     has_benchmark = DEFAULT_EXCEL.exists()
 
+    if "pending_kfl_source_redirect" in st.session_state:
+        st.session_state["kfl_data_source"] = st.session_state.pop("pending_kfl_source_redirect")
+    elif "kfl_data_source" not in st.session_state:
+        st.session_state["kfl_data_source"] = (
+            "📊 Use Preloaded Benchmark Dataset (342-Manager Validated Cohort)"
+            if has_benchmark
+            else "📂 Upload Survey Excel File (.xlsx, .xls)"
+        )
+
     col_src1, col_src2 = st.columns([1.6, 1.0])
     with col_src1:
         if has_benchmark:
@@ -201,6 +212,7 @@ if app_mode.startswith("🎯"):
                     "📂 Upload Survey Excel File (.xlsx, .xls)",
                 ],
                 horizontal=True,
+                key="kfl_data_source",
             )
         else:
             data_source = "📂 Upload Survey Excel File (.xlsx, .xls)"
@@ -252,14 +264,19 @@ if app_mode.startswith("🎯"):
         )
         col_act1, col_act2 = st.columns(2)
         with col_act1:
-            if uploaded_kfl is not None and st.button("🚀 Open this file in Universal Cleaner & Statistical Studio", type="primary"):
-                st.session_state["passed_uploaded_file"] = uploaded_kfl
-                st.session_state["app_mode_nav"] = NAV_MODES[1]
-                st.rerun()
+            if uploaded_kfl is not None:
+                if st.button("🚀 Open this file in Universal Cleaner & Statistical Studio", type="primary"):
+                    st.session_state["passed_uploaded_file"] = {
+                        "name": getattr(uploaded_kfl, "name", "uploaded_file.xlsx"),
+                        "bytes": uploaded_kfl.getvalue(),
+                    }
+                    st.session_state["pending_mode_redirect"] = NAV_MODES[1]
+                    st.rerun()
         with col_act2:
-            if has_benchmark and st.button("📊 Switch back to Preloaded Benchmark Dataset"):
-                st.session_state["kfl_data_source"] = "📊 Use Preloaded Benchmark Dataset (342-Manager Validated Cohort)"
-                st.rerun()
+            if has_benchmark:
+                if st.button("📊 Switch back to Preloaded Benchmark Dataset"):
+                    st.session_state["pending_kfl_source_redirect"] = "📊 Use Preloaded Benchmark Dataset (342-Manager Validated Cohort)"
+                    st.rerun()
         render_footer()
         render_sidebar_footer()
         st.stop()
@@ -717,15 +734,20 @@ elif app_mode.startswith("🔍"):
         unsafe_allow_html=True,
     )
 
-    passed_file = st.session_state.get("passed_uploaded_file", None)
+    passed_file_info = st.session_state.get("passed_uploaded_file", None)
     uploaded_general = st.file_uploader("Upload Any Excel or CSV File (.xlsx, .xls, .csv):", type=["xlsx", "xls", "csv"])
 
     if uploaded_general is not None:
         if "passed_uploaded_file" in st.session_state:
             st.session_state.pop("passed_uploaded_file", None)
-    elif passed_file is not None:
-        uploaded_general = passed_file
-        st.info(f"📂 Currently analyzing file forwarded from Preset Studio: **{passed_file.name}**")
+    elif passed_file_info is not None:
+        if isinstance(passed_file_info, dict):
+            file_bytes = io.BytesIO(passed_file_info["bytes"])
+            file_bytes.name = passed_file_info["name"]
+            uploaded_general = file_bytes
+        else:
+            uploaded_general = passed_file_info
+        st.info(f"📂 Currently analyzing file forwarded from Preset Studio: **{uploaded_general.name}**")
 
     if uploaded_general is None:
         st.info("👆 Upload any survey or messy data file above to begin.")
