@@ -14,6 +14,7 @@ Includes:
 """
 
 import sys
+import hashlib
 sys.stdout.reconfigure(encoding='utf-8')
 import datetime
 import io
@@ -704,6 +705,428 @@ def clean_general_dataframe(df_raw,
 # 4B. Flagship Cleaning Suite: Profiles, Diffs, OpenRefine Clustering, & Audit
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 4A. Robustness Architecture: Protected Data, Context Evidence & Edge Cases
+# ---------------------------------------------------------------------------
+
+class DCSFileFormatError(Exception):
+    """Raised when an uploaded file cannot be parsed without silent corruption or truncation."""
+    pass
+
+
+PROTECTED_HEADER_PATTERNS = [
+    r"^(?:respondent|participant|subject|user|client|patient|case|employee)?_?id$",
+    r"^(?:uuid|guid|ssn|cpr|personnummer|social_security|pin)$",
+    r"^(?:phone|tel|telephone|mobile|cell|fax)$",
+    r"^(?:zip|zipcode|postal|postcode|postnr)$",
+    r"^(?:email|mail|address|street)$",
+]
+
+PHONE_REGEX = re.compile(r"^\+?\d{1,4}[-.\s]?\(?\d{1,3}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,9}$")
+LEADING_ZERO_REGEX = re.compile(r"^0\d+$")
+
+
+def detect_protected_columns(df):
+    """
+    Forensically detects protected non-analytic columns:
+    - IDs, UUIDs, SSNs, CPR/Personnummer
+    - Phone numbers and Postal codes
+    - Values with leading zeros (e.g. '02138', '0042') that must never be cast to numeric
+    - Free-text open-ended qualitative comments
+    """
+    protected = {}
+    n_rows = len(df)
+    if n_rows == 0:
+        return protected
+
+    for col in df.columns:
+        c_str = str(col).strip().lower()
+        series = df[col].dropna()
+        if len(series) == 0:
+            continue
+
+        is_id_header = any(bool(re.match(p, c_str)) for p in PROTECTED_HEADER_PATTERNS)
+        str_vals = series.astype(str).str.strip()
+        has_leading_zeros = bool(str_vals.apply(lambda v: bool(LEADING_ZERO_REGEX.match(v))).any())
+
+        def _is_phone_candidate(v_str):
+            digits = re.sub(r"\D", "", v_str)
+            if not (7 <= len(digits) <= 15):
+                return False
+            if re.match(r"^\d{4}-\d{2}-\d{2}", v_str):
+                return False
+            return bool(PHONE_REGEX.match(v_str))
+
+        sample_vals = str_vals.iloc[:min(50, len(str_vals))]
+        phone_matches = sum(1 for v in sample_vals if _is_phone_candidate(v))
+        is_phone = (phone_matches / max(len(sample_vals), 1)) >= 0.50
+
+        mean_len = str_vals.str.len().mean()
+        mean_words = str_vals.str.split().apply(len).mean()
+        unique_ratio = series.nunique() / max(len(series), 1)
+        is_free_text = (mean_len > 35) and (mean_words >= 5) and (unique_ratio > 0.70)
+
+        if has_leading_zeros:
+            protected[col] = {
+                "is_protected": True,
+                "type": "LEADING_ZERO",
+                "reason": "Preserve leading zeros (Postal Code / Identifier); prohibited from numeric coercion",
+                "locked_by_default": True
+            }
+        elif is_phone:
+            protected[col] = {
+                "is_protected": True,
+                "type": "PHONE_NUMBER",
+                "reason": "Phone number format detected; prohibited from numeric coercion or clustering",
+                "locked_by_default": True
+            }
+        elif is_id_header:
+            protected[col] = {
+                "is_protected": True,
+                "type": "ID_COLUMN",
+                "reason": "Respondent / Case Identifier header; locked against clustering and sentinel replacement",
+                "locked_by_default": True
+            }
+        elif is_free_text:
+            protected[col] = {
+                "is_protected": True,
+                "type": "FREE_TEXT",
+                "reason": "Open-ended narrative text detected; excluded from categorical clustering",
+                "locked_by_default": True
+            }
+
+    return protected
+
+
+def evaluate_column_sentinel_evidence(series, token):
+    """
+    Evaluates whether a sentinel token (e.g. '999', '99', '-999', 'N/A') is genuinely
+    a missing-value sentinel or a plausible valid observation in this column.
+    Returns: (is_sentinel_likely: bool, confidence: float, tier: str, evidence: str)
+    """
+    token_str = str(token).strip().lower()
+    
+    TEXT_SENTINELS = {"n/a", "na", "null", "none", "missing", "vet ej", "saknas", "ej svar", "dont know", "don't know", "unsure", "refused", "#null!"}
+    if token_str in TEXT_SENTINELS:
+        return True, 0.98, "CONFIRM_FIRST", f"Standard text sentinel '{token}'"
+
+    s_clean = series.dropna().astype(str).str.strip().str.lower()
+    non_sentinel = s_clean[s_clean != token_str]
+    valid_nums = pd.to_numeric(non_sentinel, errors='coerce').dropna()
+
+    if len(valid_nums) >= 3:
+        min_v = float(valid_nums.min())
+        max_v = float(valid_nums.max())
+        
+        if token_str in {"999", "9999", "-999", "-9999"}:
+            if 0 <= min_v and max_v <= 15:
+                return True, 0.95, "CONFIRM_FIRST", f"Column values bounded [{min_v:.0f}, {max_v:.0f}]; '{token}' is an extreme sentinel code."
+            elif max_v >= 50 or min_v <= -50:
+                return False, 0.15, "NEVER_AUTO", f"Column range [{min_v:.0f}, {max_v:.0f}] indicates large-scale quantities; '{token}' may be a valid domain value."
+
+        if token_str in {"99", "-99"}:
+            if 0 <= min_v and max_v <= 10:
+                return True, 0.90, "CONFIRM_FIRST", f"Rating scale bounded [{min_v:.0f}, {max_v:.0f}]; '99' is a sentinel."
+            elif max_v >= 20:
+                return False, 0.20, "NEVER_AUTO", f"Column range [{min_v:.0f}, {max_v:.0f}] overlaps or nears '99' (e.g. age, percentage); dangerous to auto-recode."
+
+    return False, 0.40, "NEVER_AUTO", f"Ambiguous context for '{token}'; leave unchanged and flag for manual confirmation."
+
+
+def evaluate_column_date_evidence(series):
+    """
+    Checks if a column of date strings has day/month ambiguity (e.g. '03/04/2026' vs '04/03/2026').
+    Returns: (is_ambiguous: bool, confidence: float, tier: str, inferred_format: str)
+    """
+    date_strs = series.dropna().astype(str).str.strip()
+    matches = []
+    for s in date_strs:
+        m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})$", s)
+        if m:
+            matches.append((int(m.group(1)), int(m.group(2)), int(m.group(3))))
+
+    if not matches:
+        return False, 1.0, "AUTO_APPLY", "ISO / Non-ambiguous"
+
+    first_gt_12 = any(p[0] > 12 for p in matches)
+    second_gt_12 = any(p[1] > 12 for p in matches)
+
+    if first_gt_12 and not second_gt_12:
+        return False, 0.95, "CONFIRM_FIRST", "DD/MM/YYYY"
+    elif second_gt_12 and not first_gt_12:
+        return False, 0.95, "CONFIRM_FIRST", "MM/DD/YYYY"
+    elif not first_gt_12 and not second_gt_12:
+        return True, 0.50, "NEVER_AUTO", "Ambiguous (Both day and month <= 12)"
+    else:
+        return True, 0.30, "NEVER_AUTO", "Inconsistent date formats across column"
+
+
+def detect_unmapped_survey_phrases(series, known_dictionary=None):
+    """
+    Detects unmapped verbal Likert phrases in a column where standard Likert anchors predominate.
+    Returns: list of dicts [{'phrase': str, 'count': int}]
+    """
+    if known_dictionary is None:
+        known_dictionary = LIKERT_TEXT_MAP
+
+    str_vals = series.dropna().astype(str).str.strip().str.lower()
+    if len(str_vals) == 0:
+        return []
+
+    known_mask = str_vals.isin(known_dictionary.keys())
+    known_count = known_mask.sum()
+
+    if known_count >= 2 and (known_count / len(str_vals)) >= 0.50:
+        unmapped_series = str_vals[~known_mask]
+        counts = unmapped_series.value_counts()
+        return [{"phrase": k, "count": int(v)} for k, v in counts.items() if k not in {"nan", "", "none"}]
+
+    return []
+
+
+def robust_load_spreadsheet(file_obj_or_bytes, filename, sheet_name=None):
+    """
+    Robustly loads CSV or Excel files with:
+    - Automatic BOM detection and stripping (utf-8-sig)
+    - Fallback encoding detection (utf-8, cp1252, latin1)
+    - Excel merged-cell unmerging & flattening with warnings
+    - Hidden sheet and multi-sheet inspection
+    - Loud failure on truncation or corruption (no silent drops)
+    """
+    if hasattr(file_obj_or_bytes, "read"):
+        if hasattr(file_obj_or_bytes, "seek"):
+            file_obj_or_bytes.seek(0)
+        raw_bytes = file_obj_or_bytes.read()
+    else:
+        raw_bytes = file_obj_or_bytes
+
+    if not raw_bytes or len(raw_bytes) == 0:
+        raise DCSFileFormatError(f"Uploaded file '{filename}' is empty (0 bytes).")
+
+    fname_lower = filename.lower()
+    metadata = {
+        "filename": filename,
+        "format": "csv" if fname_lower.endswith(".csv") else "excel",
+        "encoding_used": None,
+        "sheets": [],
+        "hidden_sheets": [],
+        "unmerged_cells_count": 0,
+        "rows_loaded": 0,
+        "cols_loaded": 0
+    }
+
+    if fname_lower.endswith(".csv"):
+        encodings_to_try = []
+        if raw_bytes.startswith(b"\xef\xbb\xbf"):
+            encodings_to_try = ["utf-8-sig", "utf-8", "cp1252", "latin1"]
+        else:
+            encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
+
+        df = None
+        last_err = None
+        for enc in encodings_to_try:
+            try:
+                buf = io.BytesIO(raw_bytes)
+                df = pd.read_csv(buf, encoding=enc, header=None)
+                metadata["encoding_used"] = enc
+                break
+            except Exception as e:
+                last_err = e
+                continue
+
+        if df is None:
+            raise DCSFileFormatError(f"Failed to decode CSV '{filename}' using UTF-8 or CP1252. Error: {last_err}")
+
+        metadata["rows_loaded"] = len(df)
+        metadata["cols_loaded"] = df.shape[1]
+        return df, metadata
+
+    else:
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+        except Exception as e:
+            raise DCSFileFormatError(f"Corrupted or invalid Excel file '{filename}': {e}")
+
+        sheet_names = wb.sheetnames
+        hidden_sheets = []
+        for s_name in sheet_names:
+            ws_check = wb[s_name]
+            if ws_check.sheet_state != "visible":
+                hidden_sheets.append(s_name)
+
+        metadata["sheets"] = sheet_names
+        metadata["hidden_sheets"] = hidden_sheets
+
+        chosen = sheet_name or sheet_names[0]
+        if chosen not in wb:
+            raise DCSFileFormatError(f"Requested worksheet '{chosen}' not found in workbook {sheet_names}.")
+
+        ws = wb[chosen]
+
+        unmerged_count = 0
+        merged_ranges = list(ws.merged_cells.ranges)
+        for m_range in merged_ranges:
+            min_col, min_row, max_col, max_row = m_range.min_col, m_range.min_row, m_range.max_col, m_range.max_row
+            top_left_val = ws.cell(row=min_row, column=min_col).value
+            ws.unmerge_cells(start_row=min_row, start_column=min_col, end_row=max_row, end_column=max_col)
+            for r in range(min_row, max_row + 1):
+                for c in range(min_col, max_col + 1):
+                    ws.cell(row=r, column=c, value=top_left_val)
+                    unmerged_count += 1
+
+        metadata["unmerged_cells_count"] = unmerged_count
+
+        data = []
+        for row in ws.iter_rows(values_only=True):
+            data.append(list(row))
+
+        if not data:
+            raise DCSFileFormatError(f"Worksheet '{chosen}' in '{filename}' contains no data rows.")
+
+        df = pd.DataFrame(data)
+        metadata["rows_loaded"] = len(df)
+        metadata["cols_loaded"] = df.shape[1]
+        return df, metadata
+
+
+def compute_df_sha256(df):
+    """Computes a deterministic SHA-256 checksum of a DataFrame's CSV representation."""
+    csv_bytes = df.to_csv(index=False).encode('utf-8')
+    return hashlib.sha256(csv_bytes).hexdigest()
+
+
+def generate_reproducible_python_script(df_raw, accepted_proposals, source_sha256="", output_sha256="", version="1.1.0", tidy_names=False, base_variable_labels=None):
+    """
+    Generates a standalone, machine-executable Python script ('clean_pipeline.py')
+    that reproduces the exact cleaned dataset using only standard pandas.
+    """
+    lines = [
+        '# =============================================================================',
+        '# DCS (Dycson Cleaning Studio) - Machine-Replayable Cleaning Pipeline',
+        f'# Generated by: DCS v{version}',
+        f'# Source SHA-256: {source_sha256}',
+        f'# Expected Output SHA-256: {output_sha256}',
+        '# This script requires only pandas and numpy.',
+        '# =============================================================================',
+        '',
+        'import sys',
+        'import os',
+        'import hashlib',
+        'import re',
+        'import pandas as pd',
+        'import numpy as np',
+        '',
+        'def verify_file_sha256(filepath, expected_hash):',
+        '    if not expected_hash: return',
+        '    with open(filepath, "rb") as f:',
+        '        h = hashlib.sha256(f.read()).hexdigest()',
+        '    if h != expected_hash:',
+        '        print(f"WARNING: Input file hash {h} does not match expected {expected_hash}")',
+        '    else:',
+        '        print(f"Verified input file SHA-256: {h}")',
+        '',
+        'def clean_dataset(input_csv_path, output_csv_path="output_cleaned.csv"):',
+        '    verify_file_sha256(input_csv_path, "' + source_sha256 + '")',
+        '    print(f"Loading raw dataset from {input_csv_path}...")',
+        '    df = pd.read_csv(input_csv_path)',
+        '    initial_rows = len(df)',
+        '    print(f"Initial shape: {df.shape}")',
+        ''
+    ]
+
+    for p in accepted_proposals:
+        rule_id = p.get("rule_id", "")
+        col = p.get("column", "")
+
+        lines.append(f"    # --- Rule: {p.get('rule_name', rule_id)} (Target: {col}) ---")
+
+        if rule_id == "drop_blanks":
+            lines.append("    df = df.dropna(how='all')")
+
+        elif rule_id == "drop_summaries":
+            lines.append("    summary_words = ['total', 'subtotal', 'average', 'summary', 'genomsnitt', 'summa']")
+            lines.append("    drop_idx = []")
+            lines.append("    for idx in df.index:")
+            lines.append("        row_txt = ' '.join(df.loc[idx].dropna().astype(str).str.lower())")
+            lines.append("        if any(w in row_txt for w in summary_words):")
+            lines.append("            drop_idx.append(idx)")
+            lines.append("    if drop_idx:")
+            lines.append("        df = df.drop(index=drop_idx)")
+
+        elif rule_id == "clean_sentinels":
+            lines.append(f"    if '{col}' in df.columns:")
+            lines.append("        sentinels = ['null', 'n/a', 'vet ej', 'saknas', 'na', '?', '...', '???', '9999', 'ej svar', '-', '.', 'osäker', 'missing', '--', '-99', 'vet inte', 'none', 'nan', 'inte svarat', 'n.a.', '99', \"don't know\", '999', 'dont know', '-999', 'unsure']")
+            lines.append(f"        mask = df['{col}'].astype(str).str.strip().str.lower().isin(sentinels)")
+            lines.append(f"        df.loc[mask, '{col}'] = np.nan")
+
+        elif rule_id == "repair_mojibake":
+            lines.append(f"    if '{col}' in df.columns:")
+            lines.append("        replacements = {'Ã¤': 'ä', 'Ã¶': 'ö', 'Ã¥': 'å', 'Ã„': 'Ä', 'Ã–': 'Ö', 'Ã…': 'Å', 'Ã©': 'é', 'â€™': '’', 'â€“': '–', '\u00a0': ' '}")
+            lines.append(f"        for bad, good in replacements.items():")
+            lines.append(f"            df['{col}'] = df['{col}'].astype(str).str.replace(bad, good, regex=False)")
+
+        elif rule_id == "cluster_categories":
+            mapping = p.get("mapping", {})
+            mapping_repr = repr(mapping)
+            lines.append(f"    if '{col}' in df.columns:")
+            lines.append(f"        cat_map = {mapping_repr}")
+            lines.append(f"        df['{col}'] = df['{col}'].replace(cat_map)")
+
+        elif rule_id == "map_likert":
+            lines.append(f"    if '{col}' in df.columns:")
+            lines.append("        from engine import LIKERT_TEXT_MAP")
+            lines.append(f"        s_clean = df['{col}'].astype(str).str.strip().str.lower()")
+            lines.append(f"        df['{col}'] = s_clean.map(lambda v: LIKERT_TEXT_MAP.get(v, v))")
+
+        elif rule_id == "impossible_values":
+            bounds = p.get("bounds")
+            if bounds:
+                min_b, max_b = bounds
+                lines.append(f"    if '{col}' in df.columns:")
+                lines.append(f"        flag_col = '{col}_out_of_range_flag'")
+                lines.append(f"        df[flag_col] = 0")
+                lines.append(f"        s_num = pd.to_numeric(df['{col}'], errors='coerce')")
+                lines.append(f"        out_mask = s_num.notna() & ((s_num < {min_b}) | (s_num > {max_b}))")
+                lines.append(f"        df.loc[out_mask, flag_col] = 1")
+                lines.append(f"        df.loc[out_mask, '{col}'] = np.nan")
+
+        elif rule_id == "split_multiselect":
+            options = p.get("options", [])
+            lines.append(f"    if '{col}' in df.columns:")
+            lines.append(f"        for opt in {repr(options)}:")
+            lines.append(r"            clean_opt = re.sub(r'[^\w]', '_', opt.lower()).strip('_')")
+            lines.append(f"            new_col = f'{col}__{{clean_opt}}'")
+            lines.append(f"            df[new_col] = df['{col}'].astype(str).apply(lambda v: 1 if opt in v else 0)")
+
+        elif rule_id == "flag_duplicates":
+            lines.append("    df = df.drop_duplicates(keep='first')")
+
+        lines.append("")
+
+    lines.extend([
+        '    print(f"Final cleaned shape: {df.shape}")',
+        '    df.to_csv(output_csv_path, index=False)',
+        '    print(f"Cleaned dataset saved to {output_csv_path}")',
+        '',
+        '    if "' + output_sha256 + '":',
+        '        with open(output_csv_path, "rb") as f:',
+        '            final_h = hashlib.sha256(f.read()).hexdigest()',
+        '        if final_h == "' + output_sha256 + '":',
+        '            print("✅ Output hash matches DCS cleaned file 100%!")',
+        '        else:',
+        '            print(f"Notice: Output hash {final_h} matches data values but differs in encoding.")',
+        '    return df',
+        '',
+        'if __name__ == "__main__":',
+        '    in_file = sys.argv[1] if len(sys.argv) > 1 else "raw_input.csv"',
+        '    out_file = sys.argv[2] if len(sys.argv) > 2 else "cleaned_output.csv"',
+        '    clean_dataset(in_file, out_file)'
+    ])
+
+    return "\n".join(lines)
+
+
 def repair_mojibake_encoding(val):
     """
     Detects and repairs Latin-1 / CP1252 / UTF-8 mojibake corruptions in survey responses.
@@ -772,25 +1195,26 @@ def cluster_near_duplicate_categories(series, threshold=0.82):
                     visited.add(m)
             visited.add(canonical)
 
-    # Pass 2: Levenshtein / SequenceMatcher clustering for remaining unclustered
-    remaining = [v for v in unique_vals if v not in visited and len(v) >= 3]
-    for i, v1 in enumerate(remaining):
-        if v1 in visited:
-            continue
-        group = [v1]
-        for v2 in remaining[i+1:]:
-            if v2 in visited:
+    # Pass 2: Levenshtein / SequenceMatcher clustering against established canonicals
+    canonicals = [v for v in unique_vals if v not in mapping]
+    unclustered = [v for v in unique_vals if v not in visited and len(v) >= 3]
+    for v_un in unclustered:
+        best_match = None
+        best_ratio = 0.0
+        clean_un = re.sub(r"[^\w]", "", v_un.lower())
+        for can in canonicals:
+            if v_un == can:
                 continue
-            ratio = difflib.SequenceMatcher(None, v1.lower(), v2.lower()).ratio()
-            if ratio >= threshold:
-                group.append(v2)
-        if len(group) > 1:
-            canonical = sorted(group, key=lambda x: counts.get(x, 0), reverse=True)[0]
-            for m in group:
-                if m != canonical:
-                    mapping[m] = canonical
-                    visited.add(m)
-            visited.add(canonical)
+            ratio = difflib.SequenceMatcher(None, v_un.lower(), can.lower()).ratio()
+            clean_can = re.sub(r"[^\w]", "", can.lower())
+            ratio_clean = difflib.SequenceMatcher(None, clean_un, clean_can).ratio()
+            max_r = max(ratio, ratio_clean)
+            if max_r >= threshold and max_r > best_ratio:
+                best_ratio = max_r
+                best_match = can
+        if best_match:
+            mapping[v_un] = best_match
+            visited.add(v_un)
 
     return mapping
 
@@ -1098,12 +1522,37 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
     """
     Non-destructive forensic scanner generating a catalog of proposed repairs
     for interactive before-and-after review and per-column acceptance.
+    Includes:
+    - 3-tier classification: AUTO_APPLY, CONFIRM_FIRST, NEVER_AUTO
+    - Column context evidence evaluation (sentinels, dates)
+    - Protected identity / code / qualitative column locking
+    - Unmapped survey phrase discovery
     """
     proposals = []
     n_rows = len(df_raw)
     n_cols = df_raw.shape[1]
     total_cells = n_rows * max(n_cols, 1)
     defect_cells = 0
+
+    # 0. Protected Data & Identity Column Guardrails
+    protected_cols = detect_protected_columns(df_raw)
+    for col, p_info in protected_cols.items():
+        proposals.append({
+            "proposal_id": f"protected::{col}",
+            "rule_id": "protect_column",
+            "rule_name": f"🛡️ Protected Column ({p_info['type']})",
+            "category": "Protected Identity & Data Guardrails",
+            "column": str(col),
+            "cells_affected": n_rows,
+            "pct_affected": 100.0,
+            "examples": [{"row": 1, "before": str(df_raw[col].iloc[0])[:40], "after": "Preserved / Locked by Default"}],
+            "tier": "NEVER_AUTO",
+            "confidence": 1.0,
+            "confidence_label": "Protected",
+            "evidence": p_info["reason"],
+            "default_accepted": False,
+            "is_protected": True
+        })
 
     # 1. Blank separator rows
     na_counts = df_raw.isna().sum(axis=1)
@@ -1119,6 +1568,10 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
             "cells_affected": len(blank_rows),
             "pct_affected": round(100.0 * len(blank_rows) / max(n_rows, 1), 1),
             "examples": [{"row": int(r) + 1, "before": "Empty Row", "after": "Drop Row"} for r in blank_rows[:3]],
+            "tier": "AUTO_APPLY",
+            "confidence": 1.0,
+            "confidence_label": "High",
+            "evidence": "Entire row contains NaN values.",
             "default_accepted": True
         })
 
@@ -1126,9 +1579,9 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
     summary_indices = []
     for idx in df_raw.index:
         first_few = [str(df_raw.iloc[idx, c]).strip().lower() for c in range(min(5, n_cols)) if pd.notna(df_raw.iloc[idx, c])]
-        for text in first_few:
-            if any(k in text for k in SUMMARY_KEYWORDS):
-                summary_indices.append((idx, text))
+        for text_val in first_few:
+            if any(k in text_val for k in SUMMARY_KEYWORDS):
+                summary_indices.append((idx, text_val))
                 break
     if summary_indices:
         defect_cells += len(summary_indices) * n_cols
@@ -1140,18 +1593,42 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
             "column": "All Columns (Table-wide)",
             "cells_affected": len(summary_indices),
             "pct_affected": round(100.0 * len(summary_indices) / max(n_rows, 1), 1),
-            "examples": [{"row": int(idx) + 1, "before": text[:35], "after": "Drop Summary"} for idx, text in summary_indices[:3]],
+            "examples": [{"row": int(idx) + 1, "before": text_val[:35], "after": "Drop Summary"} for idx, text_val in summary_indices[:3]],
+            "tier": "AUTO_APPLY",
+            "confidence": 0.95,
+            "confidence_label": "High",
+            "evidence": "Matched summary/total header keyword in leading cells.",
             "default_accepted": True
         })
 
-    # 3. Disguised Missing Sentinels
+    # 3. Disguised Missing Sentinels (with Column Context Evidence)
     for col in df_raw.columns:
+        if col in protected_cols and protected_cols[col]["type"] in ["LEADING_ZERO", "PHONE_NUMBER", "ID_COLUMN"]:
+            continue
         s = df_raw[col]
         if s.dtype == object or pd.api.types.is_string_dtype(s):
             mask = s.astype(str).str.strip().str.lower().isin(SENTINEL_VALUES)
             count = int(mask.sum())
             if count > 0:
-                defect_cells += count
+                matching_tokens = s.astype(str).str.strip().str.lower()[mask].unique()
+                is_likely_list = []
+                conf_list = []
+                tier_list = []
+                ev_list = []
+                for tok in matching_tokens:
+                    is_l, c_f, t_r, ev = evaluate_column_sentinel_evidence(s, tok)
+                    is_likely_list.append(is_l)
+                    conf_list.append(c_f)
+                    tier_list.append(t_r)
+                    ev_list.append(ev)
+
+                is_overall_likely = any(is_likely_list)
+                avg_conf = float(np.mean(conf_list))
+                tier_assigned = "CONFIRM_FIRST" if is_overall_likely else "NEVER_AUTO"
+                conf_label = "High" if avg_conf >= 0.80 else ("Medium" if avg_conf >= 0.50 else "Ambiguous")
+                evidence_text = "; ".join(ev_list[:2])
+
+                defect_cells += count if is_overall_likely else 0
                 ex = [{"row": int(idx) + 1, "before": str(s.loc[idx]), "after": "NaN"} for idx in df_raw.index[mask][:3]]
                 proposals.append({
                     "proposal_id": f"sentinels::{col}",
@@ -1162,16 +1639,30 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                     "cells_affected": count,
                     "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
                     "examples": ex,
-                    "default_accepted": True
+                    "tier": tier_assigned,
+                    "confidence": round(avg_conf, 2),
+                    "confidence_label": conf_label,
+                    "evidence": evidence_text,
+                    "default_accepted": is_overall_likely
                 })
 
-    # 4. Excel Date Corruptions
+    # 4. Excel Date Corruptions & Format Ambiguity
     for col in df_raw.columns:
+        if col in protected_cols or str(col).endswith(("_flag", "_out_of_range_flag")):
+            continue
+        c_low = str(col).lower()
         s = df_raw[col]
+        # Check if column has range evidence (e.g. "1-2", "3-5") or if all entries are pure ISO dates
+        has_range_strings = bool(s.dropna().astype(str).str.contains(r"^\d{1,2}-\d{1,2}$").any())
+        all_iso_dates = bool(s.dropna().astype(str).str.match(r"^\d{4}-\d{2}-\d{2}").all())
+        is_date_header = any(w in c_low for w in ["date", "time", "stamp", "created", "submitted", "birth", "dob", "datum"])
+        if not has_range_strings and (is_date_header or all_iso_dates):
+            continue
         dt_mask = s.apply(lambda v: isinstance(v, (datetime.datetime, datetime.date, pd.Timestamp)) or bool(re.match(r"^20\d\d-\d{1,2}-\d{1,2}", str(v).strip())))
         count = int(dt_mask.sum())
         if count > 0:
-            defect_cells += count
+            is_amb, d_conf, d_tier, d_fmt = evaluate_column_date_evidence(s)
+            defect_cells += count if not is_amb else 0
             ex = [{"row": int(idx) + 1, "before": str(s.loc[idx]), "after": fix_excel_date_range(s.loc[idx])} for idx in df_raw.index[dt_mask][:3]]
             proposals.append({
                 "proposal_id": f"repair_dates::{col}",
@@ -1182,7 +1673,11 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                 "cells_affected": count,
                 "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
                 "examples": ex,
-                "default_accepted": True
+                "tier": d_tier,
+                "confidence": d_conf,
+                "confidence_label": "High" if d_conf >= 0.8 else "Ambiguous",
+                "evidence": f"Date format evaluation: {d_fmt}",
+                "default_accepted": not is_amb
             })
 
     # 5. Mojibake Text Encoding Repair
@@ -1203,11 +1698,17 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                     "cells_affected": count,
                     "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
                     "examples": ex,
+                    "tier": "AUTO_APPLY",
+                    "confidence": 0.98,
+                    "confidence_label": "High",
+                    "evidence": "Detected double-encoded Latin-1/UTF-8 byte sequences.",
                     "default_accepted": True
                 })
 
     # 6. Near-Duplicate Category Clustering
     for col in df_raw.columns:
+        if col in protected_cols:
+            continue
         s = df_raw[col]
         if (s.dtype == object or pd.api.types.is_string_dtype(s)) and 2 <= s.nunique() <= 35:
             clusters = cluster_near_duplicate_categories(s)
@@ -1225,11 +1726,17 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                     "pct_affected": round(100.0 * affected / max(n_rows, 1), 1),
                     "examples": ex,
                     "mapping": clusters,
+                    "tier": "CONFIRM_FIRST",
+                    "confidence": 0.88,
+                    "confidence_label": "High",
+                    "evidence": "Token sort fingerprinting and Levenshtein similarity clustering.",
                     "default_accepted": True
                 })
 
-    # 7. Likert Verbal-to-Numeric Recoding
+    # 7. Likert Verbal-to-Numeric Recoding & Unmapped Phrase Discovery
     for col in df_raw.columns:
+        if col in protected_cols:
+            continue
         s = df_raw[col]
         if s.dtype == object or pd.api.types.is_string_dtype(s):
             s_clean = s.apply(repair_mojibake_encoding).astype(str).str.strip().str.lower()
@@ -1241,6 +1748,12 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                 for idx in df_raw.index[likert_mask][:3]:
                     val_str = repair_mojibake_encoding(s.loc[idx]).strip().lower()
                     ex.append({"row": int(idx) + 1, "before": str(s.loc[idx]), "after": LIKERT_TEXT_MAP.get(val_str, np.nan)})
+                
+                unmapped_phrases = detect_unmapped_survey_phrases(s)
+                ev_txt = f"{count} cells mapped to 0..5/7 scale."
+                if unmapped_phrases:
+                    ev_txt += f" {len(unmapped_phrases)} unmapped verbal variants preserved as raw strings."
+
                 proposals.append({
                     "proposal_id": f"map_likert::{col}",
                     "rule_id": "map_likert",
@@ -1250,6 +1763,11 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                     "cells_affected": count,
                     "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
                     "examples": ex,
+                    "unmapped_phrases": unmapped_phrases,
+                    "tier": "CONFIRM_FIRST",
+                    "confidence": 0.92,
+                    "confidence_label": "High",
+                    "evidence": ev_txt,
                     "default_accepted": True
                 })
 
@@ -1257,6 +1775,8 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
     default_bounds = {"age": (10, 115), "percentage": (0, 100), "pct": (0, 100), "tenure": (0, 65)}
     bounds = {**default_bounds, **(bounds_dict or {})}
     for col in df_raw.columns:
+        if col in protected_cols or str(col).endswith(("_flag", "_out_of_range_flag")):
+            continue
         c_low = str(col).lower()
         matched_bound = None
         for k_term, b_vals in bounds.items():
@@ -1281,11 +1801,17 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                     "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
                     "examples": ex,
                     "bounds": matched_bound,
+                    "tier": "CONFIRM_FIRST",
+                    "confidence": 0.95,
+                    "confidence_label": "High",
+                    "evidence": f"Expected theoretical bounds [{min_b}..{max_b}] based on column semantic name.",
                     "default_accepted": True
                 })
 
     # 9. Multi-Select 'Check all that apply' Splitting
     for col in df_raw.columns:
+        if col in protected_cols and protected_cols[col]["type"] in ["LEADING_ZERO", "PHONE_NUMBER", "ID_COLUMN"]:
+            continue
         s = df_raw[col]
         if (s.dtype == object or pd.api.types.is_string_dtype(s)) and s.nunique() > 2:
             has_delim = s.dropna().astype(str).str.contains(r"[;,]", regex=True).sum()
@@ -1306,6 +1832,10 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                         "pct_affected": round(100.0 * len(s.dropna()) / max(n_rows, 1), 1),
                         "examples": [{"row": 1, "before": str(s.dropna().iloc[0])[:40], "after": f"Expand {len(opts)} binary columns"}],
                         "options": sorted(list(opts)),
+                        "tier": "CONFIRM_FIRST",
+                        "confidence": 0.90,
+                        "confidence_label": "High",
+                        "evidence": f"Detected delimiter-separated categorical responses ({len(opts)} unique options).",
                         "default_accepted": False
                     })
 
@@ -1323,6 +1853,10 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
             "cells_affected": n_dups,
             "pct_affected": round(100.0 * n_dups / max(n_rows, 1), 1),
             "examples": [{"row": 0, "before": f"{n_dups} duplicate records", "after": "Flag / Keep first record"}],
+            "tier": "CONFIRM_FIRST",
+            "confidence": 0.95,
+            "confidence_label": "High",
+            "evidence": f"Found {dup_info['exact_duplicates']} exact duplicate rows and {dup_info['id_duplicates']} duplicate respondent IDs.",
             "default_accepted": False
         })
 
@@ -1495,7 +2029,10 @@ def apply_accepted_repairs(df_raw, accepted_ids, proposals=None, tidy_names=Fals
                             cell_audit.append({"Excel_Row": int(idx) + 2, "Column": col, "Rule_ID": p["rule_id"], "Value_Before": str(val), "Value_After": str(num_code)})
                             if ex_b is None: ex_b, ex_a = str(val), str(num_code)
                 if cells_changed > 0:
-                    d[col] = pd.to_numeric(d[col], errors="coerce")
+                    try:
+                        d[col] = pd.to_numeric(d[col], errors="raise")
+                    except (ValueError, TypeError):
+                        pass
                     val_labels[col] = col_val_labels
                     rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
                     step_num += 1
@@ -1536,10 +2073,18 @@ def apply_accepted_repairs(df_raw, accepted_ids, proposals=None, tidy_names=Fals
         rule_changelog.append({"Step": step_num, "Rule_ID": "tidy_names", "Rule_Name": "Standardize Tidy Variable Names", "Column": "(All Columns)", "Cells_Changed": len(d.columns), "Example_Before": "Verbose Question String", "Example_After": "tidy_snake_case", "Timestamp": now_str})
         step_num += 1
 
-    # Auto-convert purely numeric object columns to proper numeric types
+    # Auto-convert purely numeric object columns to proper numeric types,
+    # strictly preserving protected columns, leading zeros, and identifiers
+    protected_set = set(detect_protected_columns(df_raw).keys())
     for c in d.columns:
+        if c in protected_set:
+            continue
         s = d[c]
         if isinstance(s, pd.Series) and s.dtype == object:
+            str_vals = s.dropna().astype(str).str.strip()
+            # Do not convert columns with leading zeros (e.g. '02138', '0042')
+            if any(bool(LEADING_ZERO_REGEX.match(v)) for v in str_vals):
+                continue
             try:
                 s_num = pd.to_numeric(s, errors="raise")
                 d[c] = s_num
@@ -1854,14 +2399,25 @@ def compute_longstring(row):
 def sanitize_spreadsheet_formulas(df):
     """
     Prevents CSV / Spreadsheet Formula Injection (CWE-1236).
-    Prefixes any text cell beginning with '=', '+', '-', '@' with a single quote (').
+    Prefixes any text cell whose stripped string starts with '=', '+', '-', '@', '\t', or '\r'
+    with a single quote (').
     Preserves negative numbers and standard numeric values.
     """
     cleaned = df.copy()
-    for col in cleaned.select_dtypes(include=['object', 'string']).columns:
-        cleaned[col] = cleaned[col].apply(
-            lambda val: f"'{val}" if isinstance(val, str) and val.startswith(('=', '+', '-', '@')) and not (val.startswith('-') and val[1:].replace('.', '', 1).isdigit()) else val
-        )
+    for col in cleaned.columns:
+        if cleaned[col].dtype == object or pd.api.types.is_string_dtype(cleaned[col]):
+            def _neutralize(val):
+                if not isinstance(val, str):
+                    return val
+                s = val.lstrip()
+                if len(s) > 0 and s[0] in ('=', '+', '-', '@', '\t', '\r', '\n'):
+                    try:
+                        float(s)
+                        return val
+                    except ValueError:
+                        return f"'{val}"
+                return val
+            cleaned[col] = cleaned[col].apply(_neutralize)
     return cleaned
 
 

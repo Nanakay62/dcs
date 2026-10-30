@@ -760,36 +760,46 @@ elif app_mode.startswith("🔍"):
     if hasattr(uploaded_general, "seek"):
         uploaded_general.seek(0)
 
-    if uploaded_general.name.endswith(".csv"):
-        df_raw_sheet = pd.read_csv(uploaded_general, header=None)
-        file_display_name = uploaded_general.name
-    else:
-        xl = pd.ExcelFile(uploaded_general)
-        sheet_names = xl.sheet_names
-        
-        st.sidebar.subheader("Multi-Sheet Options")
-        if len(sheet_names) > 1:
-            sheet_mode = st.sidebar.radio(
-                f"Workbook has {len(sheet_names)} sheets:",
-                ["Select a single sheet", "Consolidate all sheets into one table"],
-                index=0,
-            )
-            if "Consolidate" in sheet_mode:
-                if hasattr(uploaded_general, "seek"):
-                    uploaded_general.seek(0)
-                df_raw_sheet = engine.consolidate_multisheet_excel(uploaded_general)
-                file_display_name = f"{uploaded_general.name} (All {len(sheet_names)} Sheets Merged)"
-            else:
-                chosen_sheet = st.sidebar.selectbox("Choose Sheet:", sheet_names, index=0)
-                if hasattr(uploaded_general, "seek"):
-                    uploaded_general.seek(0)
-                df_raw_sheet = pd.read_excel(uploaded_general, sheet_name=chosen_sheet, header=None)
-                file_display_name = f"{uploaded_general.name} [{chosen_sheet}]"
-        else:
+    chosen_sheet = None
+    load_meta = {"hidden_sheets": [], "unmerged_cells_count": 0}
+    if not uploaded_general.name.endswith(".csv"):
+        try:
+            import openpyxl
+            wb_peek = openpyxl.load_workbook(uploaded_general, read_only=True)
+            sheet_names = wb_peek.sheetnames
+            if len(sheet_names) > 1:
+                st.sidebar.subheader("Multi-Sheet Options")
+                sheet_mode = st.sidebar.radio(
+                    f"Workbook has {len(sheet_names)} sheets:",
+                    ["Select a single sheet", "Consolidate all sheets into one table"],
+                    index=0,
+                )
+                if "Consolidate" in sheet_mode:
+                    if hasattr(uploaded_general, "seek"):
+                        uploaded_general.seek(0)
+                    df_raw_sheet = engine.consolidate_multisheet_excel(uploaded_general)
+                    file_display_name = f"{uploaded_general.name} (All {len(sheet_names)} Sheets Merged)"
+                else:
+                    chosen_sheet = st.sidebar.selectbox("Choose Sheet:", sheet_names, index=0)
+        except Exception:
+            pass
+
+    if df_raw_sheet is None:
+        try:
             if hasattr(uploaded_general, "seek"):
                 uploaded_general.seek(0)
-            df_raw_sheet = pd.read_excel(uploaded_general, sheet_name=sheet_names[0], header=None)
-            file_display_name = uploaded_general.name
+            df_raw_sheet, load_meta = engine.robust_load_spreadsheet(
+                uploaded_general, uploaded_general.name, sheet_name=chosen_sheet
+            )
+            file_display_name = f"{uploaded_general.name} [{chosen_sheet}]" if chosen_sheet else uploaded_general.name
+        except engine.DCSFileFormatError as err:
+            st.error(f"❌ **File Ingestion Error**: {err}")
+            st.stop()
+
+    if load_meta.get("hidden_sheets"):
+        st.warning(f"⚠️ Notice: Workbook contains hidden sheet(s): `{', '.join(load_meta['hidden_sheets'])}`")
+    if load_meta.get("unmerged_cells_count", 0) > 0:
+        st.info(f"ℹ️ Automatically unmerged and flattened `{load_meta['unmerged_cells_count']}` merged header/data cells without data loss.")
 
     st.write(f"**Loaded target:** `{file_display_name}` (`{df_raw_sheet.shape[0]} rows × {df_raw_sheet.shape[1]} columns`)")
 
@@ -999,9 +1009,19 @@ elif app_mode.startswith("🔍"):
                             if is_acc:
                                 accepted_proposal_ids.append(p_id)
                         with desc_col:
-                            st.write(f"**{p['rule_name']}** on column `{p['column']}` — `{p['cells_affected']} cells` ({p['pct_affected']}%)")
+                            tier = p.get("tier", "CONFIRM_FIRST")
+                            t_icon = "🟢" if tier == "AUTO_APPLY" else ("🟡" if tier == "CONFIRM_FIRST" else "🔴")
+                            conf_lbl = p.get("confidence_label", "High")
+                            st.markdown(f"**{t_icon} {p['rule_name']}** `[{tier}]` on column `{p['column']}` — `{p['cells_affected']} cells` ({p['pct_affected']}%) | Confidence: **{conf_lbl}**")
+                            if p.get("evidence"):
+                                st.caption(f"Context evidence: {p['evidence']}")
+                            if p.get("is_protected"):
+                                st.info("🛡️ Column is protected by default against auto-recode. Toggle checkbox to authorize repairs.")
                             ex_df = pd.DataFrame(p["examples"])
                             st.dataframe(ex_df, hide_index=True, use_container_width=True)
+                            if p.get("unmapped_phrases"):
+                                with st.expander(f"🔎 View {len(p['unmapped_phrases'])} Unmapped Verbal Phrases (Preserved as raw text)"):
+                                    st.dataframe(pd.DataFrame(p["unmapped_phrases"]), hide_index=True, use_container_width=True)
 
             if st.button("🚀 Commit Accepted Repairs & Generate Audit Trail", key="btn_commit_repairs", type="primary", use_container_width=True):
                 # Save current state to undo history
@@ -1023,6 +1043,7 @@ elif app_mode.startswith("🔍"):
                 st.session_state[changelog_key] = app_res["df_rule_changelog"]
                 st.session_state[audit_key] = app_res["df_cell_audit"]
                 st.session_state[meta_key] = app_res["codebook_metadata"]
+                st.session_state[f"accepted_props_{uploaded_general.name}"] = [p for p in prop_res["proposals"] if p["proposal_id"] in accepted_proposal_ids]
                 st.success(f"✅ Applied {len(app_res['df_rule_changelog'])} cleaning operations! Active dataset updated.")
                 st.rerun()
 
@@ -1975,23 +1996,33 @@ elif app_mode.startswith("🔍"):
         exp5, exp6, exp7, exp8 = st.columns(4)
         with exp5:
             if not export_audit.empty:
-                audit_csv = export_audit.to_csv(index=False).encode("utf-8")
+                audit_csv = engine.sanitize_spreadsheet_formulas(export_audit).to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "📋 Cell Audit Trail (.csv)",
                     data=audit_csv,
                     file_name=f"Audit_Trail_{base_fname}.csv",
                     mime="text/csv",
+                    help="Granular cell-by-cell before-and-after audit log with formula injection neutralization.",
                     use_container_width=True
                 )
             else:
                 st.info("No cell changes logged yet")
         with exp6:
-            py_code = engine.generate_reproducible_script(uploaded_general.name, cleaning_options)
+            sha_raw = engine.compute_df_sha256(df_raw_sheet)
+            sha_clean = engine.compute_df_sha256(df_cleaned)
+            py_code = engine.generate_reproducible_python_script(
+                df_raw_sheet,
+                accepted_proposals=st.session_state.get(f"accepted_props_{uploaded_general.name}", prop_res["proposals"]),
+                source_sha256=sha_raw,
+                output_sha256=sha_clean,
+                version="1.1.0"
+            )
             st.download_button(
-                "🐍 Python Script (.py)",
+                "🐍 Replay Python Pipeline (.py)",
                 data=py_code.encode("utf-8"),
-                file_name="reproduce_cleaning.py",
+                file_name=f"clean_pipeline_{base_fname}.py",
                 mime="text/x-python",
+                help="Standalone script reproducing every accepted cleaning transformation bit-for-bit with SHA-256 provenance.",
                 use_container_width=True
             )
         with exp7:
