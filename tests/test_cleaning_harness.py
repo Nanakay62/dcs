@@ -236,3 +236,79 @@ def test_spss_stata_long_variable_names_and_labels_resilience():
         if os.path.exists(tmp):
             os.remove(tmp)
 
+
+
+def test_management_and_bracketed_age_bounds_safeguard():
+    """
+    Verifies that semantic column matching avoids substring traps (e.g. 'manage' matching 'age')
+    and recognizes bracketed categorical age (1..6) without wiping valid data to NaN.
+    """
+    df_survey = pd.DataFrame({
+        "id": [1, 2, 3, 4, 5, 6],
+        "age": [1, 2, 3, 4, 5, 6],  # Bracketed categorical age (e.g. 1=18-24 ... 6=65+)
+        "Level_management": [0, 1, 2, 3, 4, 1],  # Contains 'age' inside 'management'
+        "tenure_Management": [2, 5, 8, 12, 1, 3],  # Tenure column
+        "brand_coverage": [50, 60, 70, 80, 90, 100],  # Contains 'age' inside 'coverage'
+        "real_age_continuous": [25, 42, 60, 250, 31, 19]  # True continuous age with 1 outlier (250)
+    })
+
+    prop_res = engine.propose_cleaning_repairs(df_survey)
+    props = prop_res["proposals"]
+
+    # 1. Level_management and brand_coverage must NEVER have impossible_values proposed
+    imp_cols = [p["column"] for p in props if p["rule_id"] == "impossible_values"]
+    assert "Level_management" not in imp_cols
+    assert "brand_coverage" not in imp_cols
+    assert "age" not in imp_cols  # Bracketed categorical age skipped
+
+    # 2. real_age_continuous should catch only the 250 outlier
+    assert "real_age_continuous" in imp_cols
+    age_prop = next(p for p in props if p["column"] == "real_age_continuous")
+    assert age_prop["cells_affected"] == 1
+
+    # 3. Apply repairs and ensure valid columns are 100% preserved
+    default_ids = [p["proposal_id"] for p in props if p.get("default_accepted")]
+    apply_res = engine.apply_accepted_repairs(df_survey, default_ids, proposals=props)
+    df_clean = apply_res["df_cleaned"]
+
+    assert df_clean["age"].notna().sum() == 6
+    assert df_clean["Level_management"].notna().sum() == 6
+    assert df_clean["brand_coverage"].notna().sum() == 6
+    assert df_clean["real_age_continuous"].notna().sum() == 5  # 250 converted to NaN
+
+
+def test_detect_candidate_scale_items_and_statistical_engines():
+    """
+    Verifies that candidate scale item detection filters out demographics and IDs,
+    and all statistical engines report informative diagnostics when bad columns are passed.
+    """
+    df = pd.DataFrame({
+        "id": range(1, 21),
+        "is_Manger": [0, 1] * 10,
+        "gender": [1, 2] * 10,
+        "age": [3, 4] * 10,
+        "Level_management": [1, 2] * 10,
+        "KFL1": [3, 4, 5, 2, 1] * 4,
+        "KFL2": [4, 5, 3, 2, 4] * 4,
+        "KFL3": [2, 3, 4, 5, 1] * 4,
+        "KFL4": [5, 4, 3, 2, 1] * 4,
+        "empty_var": [np.nan] * 20
+    })
+
+    scale_items = engine.detect_candidate_scale_items(df)
+    assert "KFL1" in scale_items
+    assert "KFL2" in scale_items
+    assert "is_Manger" not in scale_items
+    assert "gender" not in scale_items
+    assert "id" not in scale_items
+    assert "empty_var" not in scale_items
+
+    # Test that PCA and EFA return informative errors naming empty_var
+    pca_err = engine.compute_pca_factor_analysis(df, ["KFL1", "empty_var"])
+    assert pca_err is not None and "empty_var" in pca_err.get("error", "")
+
+    efa_err = engine.compute_efa(df, ["KFL1", "KFL2", "empty_var"])
+    assert efa_err is not None and "empty_var" in efa_err.get("error", "")
+
+    ols_err = engine.compute_linear_regression(df, "KFL1", ["empty_var"])
+    assert ols_err is not None and "empty_var" in ols_err.get("error", "")

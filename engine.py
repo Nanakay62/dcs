@@ -338,6 +338,80 @@ def get_numeric_columns(df):
     return numeric_cols
 
 
+def detect_candidate_scale_items(df, num_cols=None):
+    """
+    Intelligently identifies psychometric Likert / rating scale survey items from a DataFrame.
+    Prioritizes battery items (e.g. Q1..Q10, KFL1..KFL23, item_1..item_5) and bounded rating
+    scales (e.g. 1..5, 1..7, 0..10), while deliberately excluding respondent IDs, index
+    placeholders ('Column_1'), binary flags, and non-scale demographic indicators
+    ('gender', 'age', 'education', 'Level_management', etc.).
+    """
+    if df is None or df.empty:
+        return []
+    if num_cols is None:
+        num_cols = get_numeric_columns(df)
+    if not num_cols:
+        return []
+
+    id_pat = re.compile(r'^(?:id|uuid|code|respondent|subjid|subject_id|row|index|column_\d+)$', re.I)
+    demo_pat = re.compile(
+        r'^(?:is_manger|is_manager|rater_role|gender|sex|age|education|level_management|'
+        r'management_level|employment_type|weekly_hours|sick_leave|work_tasks|'
+        r'company|industry|org_size|unit_size|tenure)',
+        re.I
+    )
+    item_pat = re.compile(r'^[a-zA-Z]+[_-]?\d+$')
+
+    # Count prefix occurrences across columns e.g. 'KFL', 'CPE', 'Q'
+    prefix_counts = {}
+    for c in num_cols:
+        m = re.match(r'^([a-zA-Z]+)[_-]?\d+$', str(c).strip())
+        if m:
+            pref = m.group(1).upper()
+            prefix_counts[pref] = prefix_counts.get(pref, 0) + 1
+
+    scored = []
+    for c in num_cols:
+        c_str = str(c).strip()
+        c_low = c_str.lower()
+        if id_pat.search(c_low) or c_low.endswith(('_flag', '_out_of_range_flag', '_id', '_code')):
+            continue
+        if demo_pat.search(c_low):
+            continue
+
+        s = pd.to_numeric(df[c], errors='coerce')
+        valid_n = int(s.notna().sum())
+        if valid_n < 3:
+            continue
+        n_unique = s.nunique()
+        if n_unique <= 1:
+            continue
+
+        score = 0
+        m = item_pat.match(c_str)
+        if m:
+            score += 10
+            pref_m = re.match(r'^([a-zA-Z]+)', c_str)
+            if pref_m and prefix_counts.get(pref_m.group(1).upper(), 0) >= 2:
+                score += 5
+        s_clean = s.dropna()
+        if s_clean.min() >= 0 and s_clean.max() <= 10 and n_unique <= 11:
+            score += 5
+        if valid_n >= 20:
+            score += 2
+
+        scored.append((score, c))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    scale_items = [c for score, c in scored if score >= 5]
+    if not scale_items:
+        scale_items = [c for score, c in scored]
+    if not scale_items:
+        scale_items = [c for c in num_cols if not id_pat.search(str(c).lower()) and not str(c).lower().endswith('_flag')]
+
+    return scale_items
+
+
 # ---------------------------------------------------------------------------
 # 3. Structural & Layout Reconstruction (Category A)
 # ---------------------------------------------------------------------------
@@ -1219,33 +1293,72 @@ def cluster_near_duplicate_categories(series, threshold=0.82):
     return mapping
 
 
+def is_bracketed_categorical_age(series):
+    """
+    Detects whether an 'age' column contains categorical/bracketed ordinal codes
+    (e.g. 1 = 18-24, 2 = 25-34, ..., 6 = 65+) rather than raw continuous years.
+    """
+    s_clean = pd.to_numeric(series, errors='coerce').dropna()
+    if len(s_clean) == 0:
+        return False
+    return bool(s_clean.min() >= 0 and s_clean.max() <= 12 and (s_clean % 1 == 0).all())
+
+
+def match_column_domain_bounds(col, custom_bounds=None):
+    """
+    Matches a column name to theoretical domain bounds using precise word-boundary
+    token matching, avoiding false positive substring traps (e.g. 'age' inside 'management').
+    Returns (rule_name, (min_bound, max_bound)) or None.
+    """
+    c_low = str(col).lower().strip()
+
+    # 1. Custom bounds (user-specified takes priority)
+    if custom_bounds:
+        for k_term, b_vals in custom_bounds.items():
+            k_low = str(k_term).lower().strip()
+            if k_low == c_low or re.search(r'(?:^|[_\s])' + re.escape(k_low) + r'(?:[_\s]|$)', c_low):
+                return (str(k_term), b_vals)
+
+    # 2. Tenure bounds: [0, 65]
+    if re.search(r'(?:^|[_\s])(?:tenure|anstallningstid)(?:[_\s]|$)', c_low):
+        return ("tenure", (0, 65))
+
+    # 3. Percentage bounds: [0, 100]
+    if re.search(r'(?:^|[_\s])(?:percent|percentage|pct)(?:[_\s]|$)', c_low):
+        return ("percentage", (0, 100))
+
+    # 4. Age bounds: [10, 115]
+    age_exclusions = (
+        "manage", "management", "percent", "pct", "stage", "usage", "storage",
+        "damage", "coverage", "leverage", "beverage", "average", "package",
+        "dosage", "linkage", "parentage", "shortage", "shrinkage", "breakage",
+        "drainage", "village", "advantage", "courage", "outage", "heritage",
+        "lineage", "mileage", "salvage", "hostage", "passage", "message"
+    )
+    if any(ex in c_low for ex in age_exclusions):
+        return None
+
+    if re.search(r'(?:^|[_\s])(?:age|alder|ålder)(?:[_\s]|$)', c_low):
+        return ("age", (10, 115))
+
+    return None
+
+
 def detect_impossible_domain_values(df, custom_bounds=None):
     """
     Identifies impossible or out-of-range domain values across numeric/demographic survey columns.
     Checks Age [10..115], Percentages [0..100], and user-specified custom bounds.
+    Safeguards against false-positive substring matches (e.g. 'Level_management') and
+    categorical/bracketed age columns (e.g. 1..6).
     """
-    default_bounds = {
-        "age": (10, 115),
-        "alder": (10, 115),
-        "ålder": (10, 115),
-        "pct": (0, 100),
-        "percent": (0, 100),
-        "percentage": (0, 100),
-        "tenure": (0, 65),
-    }
-    bounds = {**default_bounds, **(custom_bounds or {})}
     findings = []
 
     for col in df.columns:
-        c_low = str(col).lower()
-        matched_rule = None
-        for k_term, b_vals in bounds.items():
-            if k_term in c_low:
-                matched_rule = (k_term, b_vals)
-                break
-
+        matched_rule = match_column_domain_bounds(col, custom_bounds=custom_bounds)
         if matched_rule:
             rule_name, (min_b, max_b) = matched_rule
+            if rule_name.lower() in ("age", "alder", "ålder") and is_bracketed_categorical_age(df[col]):
+                continue
             s_num = pd.to_numeric(df[col], errors="coerce")
             out_mask = s_num.notna() & ((s_num < min_b) | (s_num > max_b))
             count = int(out_mask.sum())
@@ -1772,23 +1885,38 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                 })
 
     # 8. Impossible / Out-of-Range Domain Values
-    default_bounds = {"age": (10, 115), "percentage": (0, 100), "pct": (0, 100), "tenure": (0, 65)}
-    bounds = {**default_bounds, **(bounds_dict or {})}
     for col in df_raw.columns:
         if col in protected_cols or str(col).endswith(("_flag", "_out_of_range_flag")):
             continue
-        c_low = str(col).lower()
-        matched_bound = None
-        for k_term, b_vals in bounds.items():
-            if k_term in c_low:
-                matched_bound = b_vals
-                break
-        if matched_bound:
-            min_b, max_b = matched_bound
+        matched_rule = match_column_domain_bounds(col, custom_bounds=bounds_dict)
+        if matched_rule:
+            rule_name, (min_b, max_b) = matched_rule
+            if rule_name.lower() in ("age", "alder", "ålder") and is_bracketed_categorical_age(df_raw[col]):
+                continue
             s_num = pd.to_numeric(df_raw[col], errors='coerce')
+            valid_count = int(s_num.notna().sum())
+            if valid_count == 0:
+                continue
             out_mask = s_num.notna() & ((s_num < min_b) | (s_num > max_b))
             count = int(out_mask.sum())
             if count > 0:
+                defect_pct_col = count / max(valid_count, 1)
+                # Safeguard: if over 30% of a column violates the bound,
+                # the heuristic likely misidentified an arbitrary rating scale or category code.
+                # Principle 1: No silent change. Principle 4: Flag, never delete.
+                if defect_pct_col > 0.30 and count > 2:
+                    tier = "NEVER_AUTO"
+                    confidence = 0.30
+                    conf_label = "Ambiguous"
+                    default_acc = False
+                    ev_msg = f"Potential scale mismatch: {round(defect_pct_col * 100, 1)}% of values fall outside [{min_b}..{max_b}]. Column may be categorical or an uncalibrated scale."
+                else:
+                    tier = "CONFIRM_FIRST"
+                    confidence = 0.95
+                    conf_label = "High"
+                    default_acc = True
+                    ev_msg = f"Expected theoretical bounds [{min_b}..{max_b}] based on column semantic name."
+
                 defect_cells += count
                 ex = [{"row": int(idx) + 1, "before": f"{s_num.loc[idx]} [Outside {min_b}-{max_b}]", "after": "NaN (Flagged)"} for idx in df_raw.index[out_mask][:3]]
                 proposals.append({
@@ -1800,12 +1928,12 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                     "cells_affected": count,
                     "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
                     "examples": ex,
-                    "bounds": matched_bound,
-                    "tier": "CONFIRM_FIRST",
-                    "confidence": 0.95,
-                    "confidence_label": "High",
-                    "evidence": f"Expected theoretical bounds [{min_b}..{max_b}] based on column semantic name.",
-                    "default_accepted": True
+                    "bounds": (min_b, max_b),
+                    "tier": tier,
+                    "confidence": confidence,
+                    "confidence_label": conf_label,
+                    "evidence": ev_msg,
+                    "default_accepted": default_acc
                 })
 
     # 9. Multi-Select 'Check all that apply' Splitting
@@ -2394,6 +2522,13 @@ def compute_alpha_with_item_deleted(df_items):
     Computes overall Cronbach's alpha plus item-rest correlation and
     'Alpha if item deleted' for every item in the scale.
     """
+    if df_items is None or df_items.empty or df_items.shape[1] < 2:
+        return {"error": "At least 2 items are required for reliability analysis."}
+
+    zero_cols = [c for c in df_items.columns if pd.to_numeric(df_items[c], errors='coerce').notna().sum() == 0]
+    if zero_cols:
+        return {"error": f"Item(s) {zero_cols} have 0 valid observations. Please remove or replace them."}
+
     clean = df_items.apply(pd.to_numeric, errors='coerce').dropna()
     k = clean.shape[1]
     if k < 2 or len(clean) < 3:
@@ -2402,7 +2537,7 @@ def compute_alpha_with_item_deleted(df_items):
         if len(raw_items.dropna(how='all')) >= 3 and k >= 2:
             clean = raw_items
         else:
-            return None
+            return {"error": f"Insufficient complete cases ({len(clean)}) across items. Reliability requires at least 3 complete responses."}
 
     overall_alpha = compute_cronbach_alpha(clean)
     results = []
@@ -2691,7 +2826,10 @@ def compute_linear_regression(df, y_col, x_cols):
     n = len(clean)
     k = len(x_cols)
     if n <= k + 1:
-        return None
+        zero_cols = [c for c in cols if pd.to_numeric(df[c], errors='coerce').notna().sum() == 0]
+        if zero_cols:
+            return {"error": f"Insufficient valid complete cases (N = {n}). Variable(s) {zero_cols} contain 0 valid numeric responses. Please remove or replace them."}
+        return {"error": f"Insufficient complete cases (N = {n}) for {k} predictors. Model requires at least {k + 2} complete observations."}
     if clean[y_col].std(ddof=1) == 0 or clean[y_col].nunique() <= 1:
         return {"error": f"Dependent variable '{y_col}' has zero variance (all responses are identical). OLS regression requires variation in the outcome."}
 
@@ -2758,7 +2896,21 @@ def compute_pca_factor_analysis(df, cols, n_factors=3):
 
     clean = df[cols].apply(pd.to_numeric, errors='coerce').dropna()
     if len(clean) < 3:
-        return None
+        zero_cols = [c for c in cols if pd.to_numeric(df[c], errors='coerce').notna().sum() == 0]
+        low_cols = [c for c in cols if pd.to_numeric(df[c], errors='coerce').notna().sum() < 3]
+        if zero_cols:
+            return {
+                "error": f"Insufficient complete cases (0). The following columns contain 0 valid observations: {zero_cols}. Please remove or replace them.",
+                "zero_cols": zero_cols
+            }
+        if low_cols:
+            return {
+                "error": f"Insufficient complete cases ({len(clean)}). Columns with fewer than 3 valid responses: {low_cols}. Factor extraction requires at least 3 complete responses.",
+                "low_cols": low_cols
+            }
+        return {
+            "error": f"Insufficient complete cases ({len(clean)}) across items {cols}. Factor extraction requires at least 3 complete responses."
+        }
 
     # Identify and isolate constant / zero-variance variables
     valid_cols = [c for c in cols if clean[c].std(ddof=1) > 0 and clean[c].nunique() > 1]
@@ -2898,6 +3050,9 @@ def compute_sem_cfa(df, model_desc):
 
         clean = df[vars_needed].apply(pd.to_numeric, errors='coerce').dropna()
         if len(clean) < 5:
+            zero_cols = [c for c in vars_needed if pd.to_numeric(df[c], errors='coerce').notna().sum() == 0]
+            if zero_cols:
+                return {"error": f"Insufficient complete cases ({len(clean)} found). Variable(s) {zero_cols} contain 0 valid responses. Please remove or replace them."}
             return {"error": f"Insufficient complete cases ({len(clean)} found). Structural equation modeling requires at least 5 complete cases."}
 
         # Check for zero variance
@@ -2996,6 +3151,9 @@ def compute_multilevel_hlm(df, y_col, fixed_cols, group_col, random_slopes=None)
         clean = clean.dropna()
 
         if len(clean) < 10:
+            zero_cols = [c for c in [y_col] + valid_fixed if pd.to_numeric(df[c], errors='coerce').notna().sum() == 0]
+            if zero_cols:
+                return {"error": f"Insufficient complete rows ({len(clean)} found). Variable(s) {zero_cols} contain 0 valid observations. Please remove or replace them."}
             return {"error": f"Insufficient complete rows ({len(clean)} found) after excluding missing data. At least 10 complete cases required."}
 
         n_groups = clean[group_col].nunique()
@@ -3123,6 +3281,9 @@ def compute_repeated_measures_anova(df, time_cols, between_col=None):
         clean = clean.dropna().reset_index(drop=True)
 
         if len(clean) < 3:
+            zero_cols = [c for c in time_cols if pd.to_numeric(df[c], errors='coerce').notna().sum() == 0]
+            if zero_cols:
+                return {"error": f"Insufficient complete cases ({len(clean)} found). Measurement column(s) {zero_cols} have 0 valid observations. Please remove or replace them."}
             return {"error": f"Insufficient complete cases ({len(clean)} found) for Repeated-Measures ANOVA. At least 3 complete cases required."}
 
         if between_col:
@@ -3223,6 +3384,9 @@ def compute_logistic_regression(df, y_col, x_cols):
 
         clean = sub.dropna()
         if len(clean) < 10:
+            zero_cols = [c for c in x_cols if pd.to_numeric(df[c], errors="coerce").notna().sum() == 0]
+            if zero_cols:
+                return {"error": f"Insufficient complete rows ({len(clean)} found) for Logistic Regression. Predictor(s) {zero_cols} contain 0 valid responses."}
             return {"error": f"Insufficient complete rows ({len(clean)} found) for Logistic Regression. At least 10 complete cases required."}
 
         y_clean = clean["_Y_"]
@@ -3341,6 +3505,9 @@ def compute_cox_survival(df, duration_col, event_col, covariates):
         clean = clean[clean["_duration_"] > 0]
 
         if len(clean) < 10:
+            zero_cols = [c for c in covariates if pd.to_numeric(df[c], errors="coerce").notna().sum() == 0]
+            if zero_cols:
+                return {"error": f"Insufficient complete cases ({len(clean)} found) with duration > 0 for Cox Survival Analysis. Covariate(s) {zero_cols} contain 0 valid responses."}
             return {"error": f"Insufficient complete cases ({len(clean)} found) with duration > 0 for Cox Survival Analysis. At least 10 complete cases required."}
 
         n_events = int(clean["_event_"].sum())
@@ -3547,6 +3714,9 @@ def compute_multiple_imputation_m2(df, model_type='linear', y_col=None, x_cols=N
     df_cc = sub_df.dropna().copy()
     n_cc = len(df_cc)
     if n_cc < len(valid_x) + 2:
+        zero_x = [c for c in valid_x if sub_df[c].notna().sum() == 0]
+        if zero_x:
+            return {"error": f"Too few complete cases ({n_cc}). Predictor(s) {zero_x} have 0 valid observations."}
         return {"error": f"Too few complete cases ({n_cc}) to estimate baseline listwise deletion model."}
 
     X_cc = sm.add_constant(df_cc[valid_x])
@@ -3690,7 +3860,13 @@ def compute_efa(df, items, n_factors=2, method='principal', rotation='varimax'):
     p_vars = len(valid_items)
 
     if n_obs < p_vars:
-        return {"error": f"Insufficient complete cases ({n_obs}) for {p_vars} items. N must exceed number of variables."}
+        zero_cols = [c for c in valid_items if pd.to_numeric(df[c], errors="coerce").notna().sum() == 0]
+        if zero_cols:
+            return {
+                "error": f"Insufficient complete cases ({n_obs}) for {p_vars} items. The following columns contain 0 valid responses: {zero_cols}. Please remove or replace them before running EFA.",
+                "zero_cols": zero_cols
+            }
+        return {"error": f"Insufficient complete cases ({n_obs}) for {p_vars} items. N ({n_obs}) must exceed number of variables ({p_vars})."}
 
     try:
         from factor_analyzer import FactorAnalyzer, calculate_kmo, calculate_bartlett_sphericity
@@ -3864,9 +4040,12 @@ def compute_advanced_psychometrics(df, construct_dict):
     construct_scores = {}
     construct_lambdas = {}
 
+    dropped_constructs = []
     for c_name, items in valid_constructs.items():
         sub = df[items].apply(pd.to_numeric, errors="coerce").dropna().copy()
-        if len(sub) < len(items):
+        if len(sub) < len(items) or len(sub) < 3:
+            zero_items = [c for c in items if pd.to_numeric(df[c], errors="coerce").notna().sum() == 0]
+            dropped_constructs.append(f"{c_name} (complete N={len(sub)}, zero-valid items: {zero_items})")
             continue
 
         k = len(items)
@@ -3910,6 +4089,11 @@ def compute_advanced_psychometrics(df, construct_dict):
             "CR Adequate (>= 0.70)": "Yes" if cr >= 0.70 else "No",
             "Convergent Validity (AVE >= 0.50)": "Yes" if ave >= 0.50 else "No"
         })
+
+    if not validity_rows:
+        return {
+            "error": f"Insufficient complete cases to evaluate constructs. Details: {'; '.join(dropped_constructs)}. Please check indicator items."
+        }
 
     df_validity = pd.DataFrame(validity_rows)
 
@@ -4083,6 +4267,9 @@ def compute_mediation_analysis(df, x_col, m_col, y_col, covariates=None, n_boot=
     clean = df[analysis_vars].apply(pd.to_numeric, errors="coerce").dropna().copy()
     n_obs = len(clean)
     if n_obs < len(covs) + 15:
+        zero_cols = [c for c in analysis_vars if pd.to_numeric(df[c], errors="coerce").notna().sum() == 0]
+        if zero_cols:
+            return {"error": f"Insufficient complete cases ({n_obs}) for mediation analysis. Variable(s) {zero_cols} contain 0 valid responses."}
         return {"error": f"Insufficient complete cases ({n_obs}) for mediation analysis."}
 
     import statsmodels.api as sm
@@ -4289,6 +4476,9 @@ def compute_moderation_analysis(df, x_col, w_col, y_col, covariates=None):
     clean = df[all_vars].apply(pd.to_numeric, errors="coerce").dropna().copy()
     n_obs = len(clean)
     if n_obs < len(covs) + 10:
+        zero_cols = [c for c in all_vars if pd.to_numeric(df[c], errors="coerce").notna().sum() == 0]
+        if zero_cols:
+            return {"error": f"Insufficient complete cases ({n_obs}) for moderation analysis. Variable(s) {zero_cols} contain 0 valid responses."}
         return {"error": f"Insufficient complete cases ({n_obs}) for moderation analysis."}
 
     import statsmodels.api as sm

@@ -1175,7 +1175,9 @@ elif app_mode.startswith("🔍"):
 
         num_cols = engine.get_numeric_columns(df_cleaned)
         if len(num_cols) >= 3:
-            qc_cols = st.multiselect("Select survey items to evaluate response quality:", options=num_cols, default=num_cols[:min(18, len(num_cols))], key="careless_items")
+            qc_candidates = engine.detect_candidate_scale_items(df_cleaned, num_cols)
+            default_qc = qc_candidates[:min(18, len(qc_candidates))] if qc_candidates else num_cols[:min(18, len(num_cols))]
+            qc_cols = st.multiselect("Select survey items to evaluate response quality:", options=num_cols, default=default_qc, key="careless_items")
             
             with st.expander("⚙️ Diagnostic Threshold Settings", expanded=False):
                 th_c1, th_c2, th_c3 = st.columns(3)
@@ -1239,11 +1241,15 @@ elif app_mode.startswith("🔍"):
             with r2:
                 st.write("##### Cronbach's Alpha (α) with 'Alpha if Item Deleted'")
                 num_cols_avail = engine.get_numeric_columns(df_cleaned)
-                scale_items = st.multiselect("Select items forming the scale:", options=num_cols_avail, default=num_cols_avail[:min(6, len(num_cols_avail))])
+                alpha_candidates = engine.detect_candidate_scale_items(df_cleaned, num_cols_avail)
+                default_alpha = alpha_candidates[:min(6, len(alpha_candidates))] if alpha_candidates else num_cols_avail[:min(6, len(num_cols_avail))]
+                scale_items = st.multiselect("Select items forming the scale:", options=num_cols_avail, default=default_alpha)
 
                 if len(scale_items) >= 2:
                     rel_result = engine.compute_alpha_with_item_deleted(df_cleaned[scale_items])
-                    if rel_result and pd.notna(rel_result["overall_alpha"]):
+                    if rel_result and rel_result.get("error"):
+                        st.warning(rel_result["error"])
+                    elif rel_result and pd.notna(rel_result.get("overall_alpha")) and rel_result["overall_alpha"] is not None:
                         alpha_score = rel_result["overall_alpha"]
                         rating = "Excellent (α ≥ .90)" if alpha_score >= 0.9 else ("Good (.80 ≤ α < .90)" if alpha_score >= 0.8 else ("Acceptable (.70 ≤ α < .80)" if alpha_score >= 0.7 else "Low / Questionable (α < .70)"))
                         st.metric(f"Overall Scale Alpha (N = {rel_result['n_respondents']})", f"{alpha_score:.3f}", rating)
@@ -1278,6 +1284,7 @@ elif app_mode.startswith("🔍"):
             df_analysis = df_cleaned
 
         num_cols_analysis = engine.get_numeric_columns(df_analysis)
+        scale_items_analysis = engine.detect_candidate_scale_items(df_analysis, num_cols_analysis)
         all_cols_analysis = list(df_analysis.columns)
 
         if len(num_cols_analysis) >= 2:
@@ -1304,7 +1311,8 @@ elif app_mode.startswith("🔍"):
             # Tool 1: Correlation Matrix
             if stat_submode == "Correlation Matrix":
                 st.markdown("##### 📈 Bivariate Correlation Matrix")
-                chosen_c = st.multiselect("Select Columns for Correlation Matrix:", options=num_cols_analysis, default=num_cols_analysis[:min(8, len(num_cols_analysis))])
+                default_corr = scale_items_analysis[:min(8, len(scale_items_analysis))] if scale_items_analysis else num_cols_analysis[:min(8, len(num_cols_analysis))]
+                chosen_c = st.multiselect("Select Columns for Correlation Matrix:", options=num_cols_analysis, default=default_corr)
                 method_c = st.radio("Method:", ["pearson", "spearman"], horizontal=True)
                 if len(chosen_c) >= 2:
                     c_matrix = engine.compute_correlation_matrix(df_analysis, chosen_c, method=method_c)
@@ -1317,9 +1325,14 @@ elif app_mode.startswith("🔍"):
             # Tool 2: Multiple Linear Regression
             elif stat_submode == "Multiple Linear Regression":
                 st.markdown("##### 📐 Ordinary Least Squares (OLS) Multiple Regression")
-                reg_y_m2 = st.selectbox("Select Dependent Variable (Y):", options=num_cols_analysis, index=0)
-                pred_options = [c for c in num_cols_analysis if c != reg_y_m2]
-                reg_x_m2 = st.multiselect("Select Independent Predictors (X):", options=pred_options, default=pred_options[:min(3, len(pred_options))])
+                valid_reg_y = [c for c in num_cols_analysis if df_analysis[c].notna().sum() >= 3 and df_analysis[c].nunique() > 1]
+                reg_y_opts = valid_reg_y if valid_reg_y else num_cols_analysis
+                reg_y_m2 = st.selectbox("Select Dependent Variable (Y):", options=reg_y_opts, index=0)
+                pred_options = [c for c in num_cols_analysis if c != reg_y_m2 and df_analysis[c].notna().sum() >= 3]
+                if not pred_options:
+                    pred_options = [c for c in num_cols_analysis if c != reg_y_m2]
+                default_x = [c for c in pred_options if c in scale_items_analysis][:3] if any(c in scale_items_analysis for c in pred_options) else pred_options[:min(3, len(pred_options))]
+                reg_x_m2 = st.multiselect("Select Independent Predictors (X):", options=pred_options, default=default_x)
                 if reg_y_m2 and len(reg_x_m2) >= 1:
                     m2_reg = engine.compute_linear_regression(df_analysis, reg_y_m2, reg_x_m2)
                     if m2_reg:
@@ -1346,7 +1359,8 @@ elif app_mode.startswith("🔍"):
             # Tool 3: Principal Component Loadings
             elif stat_submode == "Principal Component Loadings (PCA)":
                 st.markdown("##### 🧩 Principal Component Factor Extraction")
-                pca_items = st.multiselect("Select Survey Items for Factor Extraction:", options=num_cols_analysis, default=num_cols_analysis[:min(10, len(num_cols_analysis))])
+                default_pca = scale_items_analysis[:min(10, len(scale_items_analysis))] if scale_items_analysis else num_cols_analysis[:min(10, len(num_cols_analysis))]
+                pca_items = st.multiselect("Select Survey Items for Factor Extraction:", options=num_cols_analysis, default=default_pca)
                 n_factors_m2 = st.slider("Factors to Extract:", min_value=1, max_value=min(10, len(pca_items)) if len(pca_items) > 1 else 2, value=2)
                 if len(pca_items) >= 2:
                     pca_res = engine.compute_pca_factor_analysis(df_analysis, pca_items, n_factors=n_factors_m2)
@@ -1556,7 +1570,8 @@ elif app_mode.startswith("🔍"):
                 st.markdown("##### 🔬 Exploratory Factor Analysis (EFA) & Horn's Parallel Analysis")
                 st.caption("Extract latent factor structures with Principal Axis Factoring (PAF) or Maximum Likelihood, oblique/orthogonal rotations, KMO sampling adequacy, and Horn's Parallel Analysis.")
 
-                efa_items = st.multiselect("Select Survey Items for EFA:", options=num_cols_analysis, default=num_cols_analysis[:min(8, len(num_cols_analysis))], key="efa_items")
+                default_efa = scale_items_analysis[:min(8, len(scale_items_analysis))] if scale_items_analysis else num_cols_analysis[:min(8, len(num_cols_analysis))]
+                efa_items = st.multiselect("Select Survey Items for EFA:", options=num_cols_analysis, default=default_efa, key="efa_items")
                 ef_c1, ef_c2, ef_c3 = st.columns(3)
                 with ef_c1:
                     n_factors_efa = st.slider("Factors to Extract:", min_value=1, max_value=min(10, len(efa_items) if efa_items else 2), value=2, key="efa_n_factors")
@@ -1614,10 +1629,11 @@ elif app_mode.startswith("🔍"):
                 
                 construct_dict = {}
                 c_cols = st.columns(n_constructs)
+                item_pool = scale_items_analysis if len(scale_items_analysis) >= n_constructs * 2 else num_cols_analysis
                 for idx, col in enumerate(c_cols, start=1):
                     with col:
                         c_name = st.text_input(f"Construct {idx} Name:", value=f"Construct_{chr(64+idx)}", key=f"c_name_{idx}")
-                        default_items = num_cols_analysis[(idx-1)*3:idx*3] if len(num_cols_analysis) >= idx*3 else num_cols_analysis[:2]
+                        default_items = item_pool[(idx-1)*3:idx*3] if len(item_pool) >= idx*3 else item_pool[:2]
                         assigned_items = st.multiselect(f"Assigned Items ({c_name}):", options=num_cols_analysis, default=default_items, key=f"c_items_{idx}")
                         if c_name and assigned_items:
                             construct_dict[c_name] = assigned_items
