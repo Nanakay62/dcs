@@ -697,6 +697,1071 @@ def clean_general_dataframe(df_raw,
 # 5. Psychometric Quality Control (Category C)
 # ---------------------------------------------------------------------------
 
+
+
+
+# ---------------------------------------------------------------------------
+# 4B. Flagship Cleaning Suite: Profiles, Diffs, OpenRefine Clustering, & Audit
+# ---------------------------------------------------------------------------
+
+def repair_mojibake_encoding(val):
+    """
+    Detects and repairs Latin-1 / CP1252 / UTF-8 mojibake corruptions in survey responses.
+    Handles double-encoded Nordic/Germanic characters (ä, ö, å, é) and typographer quotes.
+    """
+    if not isinstance(val, str) or not val:
+        return val
+    s = val
+    # Try Latin-1 to UTF-8 reconstruction if signature double-byte sequences exist
+    if any(seq in s for seq in ["Ã¤", "Ã¶", "Ã¥", "Ã„", "Ã–", "Ã…", "Ã©", "Ã¨", "â€™", "â€œ", "â€“"]):
+        try:
+            s_reconstructed = s.encode("latin-1").decode("utf-8")
+            # Only adopt if it reduced length and did not add replacement characters
+            if len(s_reconstructed) < len(s) and "�" not in s_reconstructed:
+                s = s_reconstructed
+        except Exception:
+            pass
+
+    # Direct substitution for persistent character artifacts
+    replacements = {
+        "Ã¤": "ä", "Ã¶": "ö", "Ã¥": "å", "Ã„": "Ä", "Ã–": "Ö", "Ã…": "Å",
+        "Ã©": "é", "Ã¨": "è", "Ã¼": "ü", "ÃŸ": "ß",
+        "â€™": "’", "â€˜": "‘", "â€œ": "“", "â€ ": "”", "â€": "”",
+        "â€“": "–", "â€”": "—", " ": " ", "﻿": "", "​": ""
+    }
+    for bad, good in replacements.items():
+        if bad in s:
+            s = s.replace(bad, good)
+    return s.strip()
+
+
+def cluster_near_duplicate_categories(series, threshold=0.82):
+    """
+    OpenRefine-style category clustering using fingerprinting and Levenshtein similarity.
+    Clusters casing variants, minor typos, and whitespace differences (e.g. 'Full-time' vs 'full time').
+    Returns a dictionary mapping variant strings to the canonical (most frequent) category.
+    """
+    import difflib
+    s_clean = series.dropna().astype(str).str.strip()
+    counts = s_clean.value_counts()
+    unique_vals = list(counts.index)
+    if len(unique_vals) <= 1:
+        return {}
+
+    def get_fingerprint(text):
+        cleaned = re.sub(r"[^\w\s]", "", text.lower())
+        tokens = sorted(list(set(cleaned.split())))
+        return " ".join(tokens)
+
+    # Pass 1: Key-collision fingerprint clustering
+    fp_map = {}
+    for v in unique_vals:
+        fp = get_fingerprint(v)
+        if fp not in fp_map:
+            fp_map[fp] = []
+        fp_map[fp].append(v)
+
+    mapping = {}
+    visited = set()
+    for fp, group in fp_map.items():
+        if len(group) > 1:
+            canonical = sorted(group, key=lambda x: counts.get(x, 0), reverse=True)[0]
+            for m in group:
+                if m != canonical:
+                    mapping[m] = canonical
+                    visited.add(m)
+            visited.add(canonical)
+
+    # Pass 2: Levenshtein / SequenceMatcher clustering for remaining unclustered
+    remaining = [v for v in unique_vals if v not in visited and len(v) >= 3]
+    for i, v1 in enumerate(remaining):
+        if v1 in visited:
+            continue
+        group = [v1]
+        for v2 in remaining[i+1:]:
+            if v2 in visited:
+                continue
+            ratio = difflib.SequenceMatcher(None, v1.lower(), v2.lower()).ratio()
+            if ratio >= threshold:
+                group.append(v2)
+        if len(group) > 1:
+            canonical = sorted(group, key=lambda x: counts.get(x, 0), reverse=True)[0]
+            for m in group:
+                if m != canonical:
+                    mapping[m] = canonical
+                    visited.add(m)
+            visited.add(canonical)
+
+    return mapping
+
+
+def detect_impossible_domain_values(df, custom_bounds=None):
+    """
+    Identifies impossible or out-of-range domain values across numeric/demographic survey columns.
+    Checks Age [10..115], Percentages [0..100], and user-specified custom bounds.
+    """
+    default_bounds = {
+        "age": (10, 115),
+        "alder": (10, 115),
+        "ålder": (10, 115),
+        "pct": (0, 100),
+        "percent": (0, 100),
+        "percentage": (0, 100),
+        "tenure": (0, 65),
+    }
+    bounds = {**default_bounds, **(custom_bounds or {})}
+    findings = []
+
+    for col in df.columns:
+        c_low = str(col).lower()
+        matched_rule = None
+        for k_term, b_vals in bounds.items():
+            if k_term in c_low:
+                matched_rule = (k_term, b_vals)
+                break
+
+        if matched_rule:
+            rule_name, (min_b, max_b) = matched_rule
+            s_num = pd.to_numeric(df[col], errors="coerce")
+            out_mask = s_num.notna() & ((s_num < min_b) | (s_num > max_b))
+            count = int(out_mask.sum())
+            if count > 0:
+                for idx in df.index[out_mask]:
+                    findings.append({
+                        "excel_row": int(idx) + 2,
+                        "column": str(col),
+                        "value": float(s_num.loc[idx]),
+                        "expected_range": f"[{min_b} to {max_b}]",
+                        "rule": f"{rule_name.title()} domain boundary"
+                    })
+
+    return pd.DataFrame(findings) if findings else pd.DataFrame(columns=["excel_row", "column", "value", "expected_range", "rule"])
+
+
+def split_multiselect_columns(df, cols=None, delimiter=";"):
+    """
+    Expands multi-select 'Check all that apply' answer columns into binary 0/1 indicator features.
+    """
+    d = df.copy()
+    if cols is None:
+        cols = []
+        for c in d.columns:
+            s = d[c]
+            if (s.dtype == object or pd.api.types.is_string_dtype(s)) and s.nunique() > 2:
+                has_delim = s.dropna().astype(str).str.contains(r"[;,]", regex=True).sum()
+                if has_delim >= 2:
+                    cols.append(c)
+
+    expanded_metadata = {}
+    for c in cols:
+        s = d[c].dropna().astype(str)
+        options = set()
+        for val in s:
+            parts = re.split(r"[;,]\s*", val.strip())
+            for p in parts:
+                if p:
+                    options.add(p.strip())
+        if 2 <= len(options) <= 25:
+            created_cols = []
+            for opt in sorted(options):
+                clean_opt = re.sub(r"[^\w]", "_", opt).strip("_")
+                new_col = f"{c}__{clean_opt}"
+                d[new_col] = d[c].apply(lambda v: 1 if pd.notna(v) and opt in re.split(r"[;,]\s*", str(v).strip()) else 0)
+                created_cols.append((new_col, opt))
+            expanded_metadata[c] = created_cols
+
+    return d, expanded_metadata
+
+
+def detect_duplicate_respondents(df, id_cols=None):
+    """
+    Identifies exact full-row duplicates and duplicate participant IDs.
+    """
+    exact_dups = int(df.duplicated().sum())
+    id_dups = 0
+    dup_indices = []
+
+    if id_cols:
+        valid_id_cols = [c for c in id_cols if c in df.columns]
+        if valid_id_cols:
+            id_dup_mask = df.duplicated(subset=valid_id_cols, keep=False)
+            id_dups = int(id_dup_mask.sum())
+            dup_indices = list(df.index[id_dup_mask])
+    else:
+        # Auto-detect potential ID columns
+        for c in df.columns:
+            c_low = str(c).lower()
+            if any(term in c_low for term in ["respondent_id", "participant_id", "email", "ipaddress", "responseid"]):
+                id_dup_mask = df.duplicated(subset=[c], keep=False)
+                if id_dup_mask.sum() > 0:
+                    id_dups = int(id_dup_mask.sum())
+                    dup_indices = list(df.index[id_dup_mask])
+                    break
+
+    return {
+        "exact_duplicates": exact_dups,
+        "id_duplicates": id_dups,
+        "duplicate_indices": dup_indices
+    }
+
+
+def generate_tidy_variable_names(columns):
+    """
+    Standardizes messy/verbose question text into tidy snake_case variable names.
+    Returns (tidy_columns_list, mapping_dict_original_to_tidy).
+    """
+    tidy_cols = []
+    seen = {}
+    mapping = {}
+
+    for i, raw_col in enumerate(columns):
+        s = str(raw_col).strip()
+        # Remove leading question numbers e.g. '1. ', 'Q1: '
+        s_clean = re.sub(r"^(?:Q\d+[:.]?\s*|\d+[:.]\s*)", "", s, flags=re.IGNORECASE)
+        # Convert non-alphanumeric to underscores
+        s_clean = re.sub(r"[^\w\s]", "", s_clean).strip().lower()
+        s_clean = re.sub(r"\s+", "_", s_clean)
+        # Truncate overly long sentences to first 5 words
+        tokens = s_clean.split("_")
+        tidy_base = "_".join(tokens[:5]) if len(tokens) > 5 else s_clean
+        if not tidy_base:
+            tidy_base = f"var_{i+1}"
+
+        if tidy_base in seen:
+            seen[tidy_base] += 1
+            final_name = f"{tidy_base}_{seen[tidy_base]}"
+        else:
+            seen[tidy_base] = 0
+            final_name = tidy_base
+
+        tidy_cols.append(final_name)
+        mapping[raw_col] = final_name
+
+    return tidy_cols, mapping
+
+
+def detect_survey_platform_profile(df_raw):
+    """
+    Forensically detects Qualtrics, LimeSurvey, Google Forms, or Generic spreadsheet imports.
+    """
+    if df_raw is None or df_raw.empty:
+        return {"profile": "generic", "confidence": "Low", "header_rows": 1, "description": "Generic Tabular Data"}
+
+    # 1. Qualtrics 3-Row Header Check
+    if df_raw.shape[0] >= 3:
+        row0_str = " ".join([str(v).lower() for v in df_raw.iloc[0].dropna()[:10]])
+        row2_str = " ".join([str(v) for v in df_raw.iloc[2].dropna()[:10]])
+        if '{"importid":' in row2_str.lower() or "importid" in row2_str.lower():
+            return {
+                "profile": "qualtrics",
+                "confidence": "High",
+                "header_rows": 3,
+                "description": "Qualtrics 3-Row Export (Codes, Question Text, ImportId JSON)"
+            }
+        if any(term in row0_str for term in ["startdate", "enddate", "ipaddress", "progress", "finished", "responseid"]):
+            return {
+                "profile": "qualtrics",
+                "confidence": "High",
+                "header_rows": 3 if 'import' in row2_str.lower() else 2,
+                "description": "Qualtrics Metadata Export"
+            }
+
+    # 2. LimeSurvey Bracketed Subquestions Check
+    header_cand = [str(v) for v in df_raw.iloc[0].dropna()]
+    bracket_count = sum(1 for h in header_cand if re.search(r"\[.+\]", h))
+    if bracket_count >= 3:
+        return {
+            "profile": "limesurvey",
+            "confidence": "High",
+            "header_rows": 1,
+            "description": "LimeSurvey Export with Bracketed Subquestion Codes [SQ...]"
+        }
+
+    # 3. Google Forms Check
+    if len(header_cand) >= 2:
+        h0_low = header_cand[0].lower().strip()
+        if any(term in h0_low for term in ["timestamp", "tidsstämpel", "horodateur", "zeitstempel"]):
+            return {
+                "profile": "google_forms",
+                "confidence": "High",
+                "header_rows": 1,
+                "description": "Google Forms Export (Timestamp column + Full-Sentence Questions)"
+            }
+
+    return {"profile": "generic", "confidence": "Normal", "header_rows": 1, "description": "Standard Survey / Flat Spreadsheet"}
+
+
+def apply_import_profile(df_raw, profile="auto", filter_preview=True):
+    """
+    Applies the platform-specific import profile, extracting tidy variable names,
+    preserving full question text in variable labels, and dropping metadata artifacts.
+    """
+    if profile == "auto":
+        p_info = detect_survey_platform_profile(df_raw)
+        chosen_profile = p_info["profile"]
+    else:
+        chosen_profile = profile
+
+    d = df_raw.copy()
+    var_labels = {}
+
+    if chosen_profile == "qualtrics" and d.shape[0] >= 3:
+        # Row 0: Variable codes, Row 1: Full Question Text, Row 2: ImportId JSON
+        codes = [clean_text_hygiene(str(v)) if pd.notna(v) else f"Q_{i+1}" for i, v in enumerate(d.iloc[0])]
+        questions = [str(v).strip() if pd.notna(v) else "" for v in d.iloc[1]]
+        codes = make_columns_unique(codes)
+        for c, q in zip(codes, questions):
+            var_labels[c] = q
+
+        # Data starts from row 3 (0-indexed 3)
+        d_data = d.iloc[3:].copy().reset_index(drop=True)
+        d_data.columns = codes
+
+        # Filter preview rows if requested
+        if filter_preview:
+            preview_masks = []
+            for c in ["Status", "DistributionChannel"]:
+                if c in d_data.columns:
+                    preview_masks.append(d_data[c].astype(str).str.lower().isin(["survey preview", "preview"]))
+            if preview_masks:
+                combined_mask = pd.concat(preview_masks, axis=1).any(axis=1)
+                d_data = d_data.loc[~combined_mask].reset_index(drop=True)
+
+        return {
+            "df": d_data,
+            "variable_labels": var_labels,
+            "profile": "qualtrics",
+            "headers_stripped": 3
+        }
+
+    elif chosen_profile == "limesurvey":
+        # Row 0: Bracketed headers
+        raw_headers = [str(v).strip() for v in d.iloc[0]]
+        tidy_headers = []
+        for h in raw_headers:
+            var_labels[h] = h
+            m = re.match(r"^(.+?)\[(.+?)\]$", h)
+            if m:
+                tidy_name = f"{m.group(1).strip()}_{m.group(2).strip()}"
+                tidy_name = re.sub(r"[^\w]", "_", tidy_name).strip("_")
+            else:
+                tidy_name = re.sub(r"[^\w]", "_", h).strip("_")
+            tidy_headers.append(tidy_name if tidy_name else "var")
+
+        tidy_headers = make_columns_unique(tidy_headers)
+        d_data = d.iloc[1:].copy().reset_index(drop=True)
+        d_data.columns = tidy_headers
+        for tidy_c, raw_h in zip(tidy_headers, raw_headers):
+            var_labels[tidy_c] = raw_h
+
+        return {
+            "df": d_data,
+            "variable_labels": var_labels,
+            "profile": "limesurvey",
+            "headers_stripped": 1
+        }
+
+    elif chosen_profile == "google_forms":
+        raw_headers = [str(v).strip() for v in d.iloc[0]]
+        tidy_headers, _ = generate_tidy_variable_names(raw_headers)
+        d_data = d.iloc[1:].copy().reset_index(drop=True)
+        d_data.columns = tidy_headers
+        for tidy_c, raw_h in zip(tidy_headers, raw_headers):
+            var_labels[tidy_c] = raw_h
+
+        return {
+            "df": d_data,
+            "variable_labels": var_labels,
+            "profile": "google_forms",
+            "headers_stripped": 1
+        }
+
+    else:
+        # Generic flat table
+        h_idx = detect_header_row(d)
+        raw_headers = [clean_text_hygiene(str(v)) if pd.notna(v) and clean_text_hygiene(str(v)) else f"Column_{i+1}" for i, v in enumerate(d.iloc[h_idx])]
+        unique_headers = make_columns_unique(raw_headers)
+        d_data = d.iloc[h_idx + 1:].copy().reset_index(drop=True)
+        d_data.columns = unique_headers
+        for col in unique_headers:
+            var_labels[col] = str(col)
+
+        return {
+            "df": d_data,
+            "variable_labels": var_labels,
+            "profile": "generic",
+            "headers_stripped": h_idx + 1
+        }
+
+
+def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profile_info=None):
+    """
+    Non-destructive forensic scanner generating a catalog of proposed repairs
+    for interactive before-and-after review and per-column acceptance.
+    """
+    proposals = []
+    n_rows = len(df_raw)
+    n_cols = df_raw.shape[1]
+    total_cells = n_rows * max(n_cols, 1)
+    defect_cells = 0
+
+    # 1. Blank separator rows
+    na_counts = df_raw.isna().sum(axis=1)
+    blank_rows = list(df_raw.index[na_counts == n_cols])
+    if blank_rows:
+        defect_cells += len(blank_rows) * n_cols
+        proposals.append({
+            "proposal_id": "structure::blank_rows",
+            "rule_id": "drop_blanks",
+            "rule_name": "Blank Separator Rows",
+            "category": "Structure",
+            "column": "All Columns (Table-wide)",
+            "cells_affected": len(blank_rows),
+            "pct_affected": round(100.0 * len(blank_rows) / max(n_rows, 1), 1),
+            "examples": [{"row": int(r) + 1, "before": "Empty Row", "after": "Drop Row"} for r in blank_rows[:3]],
+            "default_accepted": True
+        })
+
+    # 2. Subtotal & Summary Rows
+    summary_indices = []
+    for idx in df_raw.index:
+        first_few = [str(df_raw.iloc[idx, c]).strip().lower() for c in range(min(5, n_cols)) if pd.notna(df_raw.iloc[idx, c])]
+        for text in first_few:
+            if any(k in text for k in SUMMARY_KEYWORDS):
+                summary_indices.append((idx, text))
+                break
+    if summary_indices:
+        defect_cells += len(summary_indices) * n_cols
+        proposals.append({
+            "proposal_id": "structure::summary_rows",
+            "rule_id": "drop_summaries",
+            "rule_name": "Summary & Subtotal Rows",
+            "category": "Structure",
+            "column": "All Columns (Table-wide)",
+            "cells_affected": len(summary_indices),
+            "pct_affected": round(100.0 * len(summary_indices) / max(n_rows, 1), 1),
+            "examples": [{"row": int(idx) + 1, "before": text[:35], "after": "Drop Summary"} for idx, text in summary_indices[:3]],
+            "default_accepted": True
+        })
+
+    # 3. Disguised Missing Sentinels
+    for col in df_raw.columns:
+        s = df_raw[col]
+        if s.dtype == object or pd.api.types.is_string_dtype(s):
+            mask = s.astype(str).str.strip().str.lower().isin(SENTINEL_VALUES)
+            count = int(mask.sum())
+            if count > 0:
+                defect_cells += count
+                ex = [{"row": int(idx) + 1, "before": str(s.loc[idx]), "after": "NaN"} for idx in df_raw.index[mask][:3]]
+                proposals.append({
+                    "proposal_id": f"sentinels::{col}",
+                    "rule_id": "clean_sentinels",
+                    "rule_name": "Disguised Sentinels -> NaN",
+                    "category": "Missing Data",
+                    "column": str(col),
+                    "cells_affected": count,
+                    "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
+                    "examples": ex,
+                    "default_accepted": True
+                })
+
+    # 4. Excel Date Corruptions
+    for col in df_raw.columns:
+        s = df_raw[col]
+        dt_mask = s.apply(lambda v: isinstance(v, (datetime.datetime, datetime.date, pd.Timestamp)) or bool(re.match(r"^20\d\d-\d{1,2}-\d{1,2}", str(v).strip())))
+        count = int(dt_mask.sum())
+        if count > 0:
+            defect_cells += count
+            ex = [{"row": int(idx) + 1, "before": str(s.loc[idx]), "after": fix_excel_date_range(s.loc[idx])} for idx in df_raw.index[dt_mask][:3]]
+            proposals.append({
+                "proposal_id": f"repair_dates::{col}",
+                "rule_id": "repair_dates",
+                "rule_name": "Repair Excel Date Auto-Conversions",
+                "category": "Data Integrity",
+                "column": str(col),
+                "cells_affected": count,
+                "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
+                "examples": ex,
+                "default_accepted": True
+            })
+
+    # 5. Mojibake Text Encoding Repair
+    for col in df_raw.columns:
+        s = df_raw[col]
+        if s.dtype == object or pd.api.types.is_string_dtype(s):
+            moji_mask = s.apply(lambda v: isinstance(v, str) and (repair_mojibake_encoding(v) != v))
+            count = int(moji_mask.sum())
+            if count > 0:
+                defect_cells += count
+                ex = [{"row": int(idx) + 1, "before": str(s.loc[idx]), "after": repair_mojibake_encoding(s.loc[idx])} for idx in df_raw.index[moji_mask][:3]]
+                proposals.append({
+                    "proposal_id": f"mojibake::{col}",
+                    "rule_id": "repair_mojibake",
+                    "rule_name": "Mojibake & Text Encoding Repair",
+                    "category": "Text Hygiene",
+                    "column": str(col),
+                    "cells_affected": count,
+                    "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
+                    "examples": ex,
+                    "default_accepted": True
+                })
+
+    # 6. Near-Duplicate Category Clustering
+    for col in df_raw.columns:
+        s = df_raw[col]
+        if (s.dtype == object or pd.api.types.is_string_dtype(s)) and 2 <= s.nunique() <= 35:
+            clusters = cluster_near_duplicate_categories(s)
+            if clusters:
+                affected = int(s.isin(clusters.keys()).sum())
+                defect_cells += affected
+                ex = [{"row": 0, "before": k, "after": v} for k, v in list(clusters.items())[:3]]
+                proposals.append({
+                    "proposal_id": f"cluster::{col}",
+                    "rule_id": "cluster_categories",
+                    "rule_name": "OpenRefine-Style Category Clustering",
+                    "category": "Categorical Harmonization",
+                    "column": str(col),
+                    "cells_affected": affected,
+                    "pct_affected": round(100.0 * affected / max(n_rows, 1), 1),
+                    "examples": ex,
+                    "mapping": clusters,
+                    "default_accepted": True
+                })
+
+    # 7. Likert Verbal-to-Numeric Recoding
+    for col in df_raw.columns:
+        s = df_raw[col]
+        if s.dtype == object or pd.api.types.is_string_dtype(s):
+            s_clean = s.apply(repair_mojibake_encoding).astype(str).str.strip().str.lower()
+            likert_mask = s_clean.isin(LIKERT_TEXT_MAP.keys())
+            count = int(likert_mask.sum())
+            if count >= 2 and (count / max(len(s.dropna()), 1)) >= 0.4:
+                defect_cells += count
+                ex = []
+                for idx in df_raw.index[likert_mask][:3]:
+                    val_str = repair_mojibake_encoding(s.loc[idx]).strip().lower()
+                    ex.append({"row": int(idx) + 1, "before": str(s.loc[idx]), "after": LIKERT_TEXT_MAP.get(val_str, np.nan)})
+                proposals.append({
+                    "proposal_id": f"map_likert::{col}",
+                    "rule_id": "map_likert",
+                    "rule_name": "Likert Recoding (Text -> 0..5/7 Numeric)",
+                    "category": "Psychometrics",
+                    "column": str(col),
+                    "cells_affected": count,
+                    "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
+                    "examples": ex,
+                    "default_accepted": True
+                })
+
+    # 8. Impossible / Out-of-Range Domain Values
+    default_bounds = {"age": (10, 115), "percentage": (0, 100), "pct": (0, 100), "tenure": (0, 65)}
+    bounds = {**default_bounds, **(bounds_dict or {})}
+    for col in df_raw.columns:
+        c_low = str(col).lower()
+        matched_bound = None
+        for k_term, b_vals in bounds.items():
+            if k_term in c_low:
+                matched_bound = b_vals
+                break
+        if matched_bound:
+            min_b, max_b = matched_bound
+            s_num = pd.to_numeric(df_raw[col], errors='coerce')
+            out_mask = s_num.notna() & ((s_num < min_b) | (s_num > max_b))
+            count = int(out_mask.sum())
+            if count > 0:
+                defect_cells += count
+                ex = [{"row": int(idx) + 1, "before": f"{s_num.loc[idx]} [Outside {min_b}-{max_b}]", "after": "NaN (Flagged)"} for idx in df_raw.index[out_mask][:3]]
+                proposals.append({
+                    "proposal_id": f"impossible::{col}",
+                    "rule_id": "impossible_values",
+                    "rule_name": f"Out-of-Bounds Values [{min_b}..{max_b}]",
+                    "category": "Validation & Bounds",
+                    "column": str(col),
+                    "cells_affected": count,
+                    "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
+                    "examples": ex,
+                    "bounds": matched_bound,
+                    "default_accepted": True
+                })
+
+    # 9. Multi-Select 'Check all that apply' Splitting
+    for col in df_raw.columns:
+        s = df_raw[col]
+        if (s.dtype == object or pd.api.types.is_string_dtype(s)) and s.nunique() > 2:
+            has_delim = s.dropna().astype(str).str.contains(r"[;,]", regex=True).sum()
+            if has_delim >= 2:
+                opts = set()
+                for v in s.dropna():
+                    parts = re.split(r"[;,]\s*", str(v).strip())
+                    for p in parts:
+                        if p: opts.add(p.strip())
+                if 2 <= len(opts) <= 25:
+                    proposals.append({
+                        "proposal_id": f"multiselect::{col}",
+                        "rule_id": "split_multiselect",
+                        "rule_name": f"Split Multi-Select ({len(opts)} Choices)",
+                        "category": "Structure & Expansion",
+                        "column": str(col),
+                        "cells_affected": int(len(s.dropna())),
+                        "pct_affected": round(100.0 * len(s.dropna()) / max(n_rows, 1), 1),
+                        "examples": [{"row": 1, "before": str(s.dropna().iloc[0])[:40], "after": f"Expand {len(opts)} binary columns"}],
+                        "options": sorted(list(opts)),
+                        "default_accepted": False
+                    })
+
+    # 10. Duplicate Respondents
+    dup_info = detect_duplicate_respondents(df_raw)
+    if dup_info["exact_duplicates"] > 0 or dup_info["id_duplicates"] > 0:
+        n_dups = dup_info["exact_duplicates"] + dup_info["id_duplicates"]
+        defect_cells += n_dups * n_cols
+        proposals.append({
+            "proposal_id": "duplicates::all",
+            "rule_id": "flag_duplicates",
+            "rule_name": "Flag / Deduplicate Duplicate Respondents",
+            "category": "Respondent Integrity",
+            "column": "All Columns (Table-wide)",
+            "cells_affected": n_dups,
+            "pct_affected": round(100.0 * n_dups / max(n_rows, 1), 1),
+            "examples": [{"row": 0, "before": f"{n_dups} duplicate records", "after": "Flag / Keep first record"}],
+            "default_accepted": False
+        })
+
+    health_score = max(0, min(100, round(100.0 - (defect_cells * 2.5 / max(total_cells, 1)) * 100.0, 1)))
+
+    return {
+        "proposals": proposals,
+        "total_proposals": len(proposals),
+        "total_cells": total_cells,
+        "defect_cells": defect_cells,
+        "health_score": health_score,
+        "is_success": True
+    }
+
+
+def apply_accepted_repairs(df_raw, accepted_ids, proposals=None, tidy_names=False, base_variable_labels=None):
+    """
+    Executes user-accepted repairs non-destructively, returning the cleaned dataset,
+    a rule-by-column Change Log, a granular cell-by-cell Audit Trail, and Codebook metadata.
+    """
+    if proposals is None:
+        prop_res = propose_cleaning_repairs(df_raw)
+        proposals = prop_res["proposals"]
+
+    accepted_prop_map = {p["proposal_id"]: p for p in proposals if p["proposal_id"] in accepted_ids}
+    d = df_raw.copy()
+    rule_changelog = []
+    cell_audit = []
+    step_num = 1
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    var_labels = dict(base_variable_labels or {})
+    val_labels = {}
+
+    # Step 1: Drop blank rows if accepted
+    if "structure::blank_rows" in accepted_prop_map:
+        p = accepted_prop_map["structure::blank_rows"]
+        na_counts = d.isna().sum(axis=1)
+        blank_idx = d.index[na_counts == d.shape[1]]
+        if len(blank_idx) > 0:
+            for b_idx in blank_idx:
+                cell_audit.append({"Excel_Row": int(b_idx) + 2, "Column": "(All Columns)", "Rule_ID": "drop_blanks", "Value_Before": "Empty Row", "Value_After": "Row Removed"})
+            d = d.drop(index=blank_idx).reset_index(drop=True)
+            rule_changelog.append({"Step": step_num, "Rule_ID": "drop_blanks", "Rule_Name": p["rule_name"], "Column": "(All Columns)", "Cells_Changed": len(blank_idx), "Example_Before": "Empty Row", "Example_After": "Row Removed", "Timestamp": now_str})
+            step_num += 1
+
+    # Step 2: Drop summaries if accepted
+    if "structure::summary_rows" in accepted_prop_map:
+        p = accepted_prop_map["structure::summary_rows"]
+        d, dropped_cnt = strip_summary_rows(d)
+        if dropped_cnt > 0:
+            rule_changelog.append({"Step": step_num, "Rule_ID": "drop_summaries", "Rule_Name": p["rule_name"], "Column": "(All Columns)", "Cells_Changed": dropped_cnt, "Example_Before": "Summary / Total Row", "Example_After": "Row Removed", "Timestamp": now_str})
+            step_num += 1
+
+    # Step 3: Mojibake repair
+    for p_id, p in accepted_prop_map.items():
+        if p["rule_id"] == "repair_mojibake":
+            col = p["column"]
+            if col in d.columns:
+                cells_changed = 0
+                ex_b, ex_a = None, None
+                for idx in d.index:
+                    val = d.loc[idx, col]
+                    if isinstance(val, str):
+                        repaired = repair_mojibake_encoding(val)
+                        if repaired != val:
+                            d.loc[idx, col] = repaired
+                            cells_changed += 1
+                            cell_audit.append({"Excel_Row": int(idx) + 2, "Column": col, "Rule_ID": p["rule_id"], "Value_Before": str(val), "Value_After": str(repaired)})
+                            if ex_b is None: ex_b, ex_a = str(val), str(repaired)
+                if cells_changed > 0:
+                    rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
+                    step_num += 1
+
+    # Step 4: Disguised Sentinels -> NaN
+    for p_id, p in accepted_prop_map.items():
+        if p["rule_id"] == "clean_sentinels":
+            col = p["column"]
+            if col in d.columns:
+                cells_changed = 0
+                ex_b, ex_a = None, None
+                for idx in d.index:
+                    val = d.loc[idx, col]
+                    if isinstance(val, str) and val.strip().lower() in SENTINEL_VALUES:
+                        d.loc[idx, col] = np.nan
+                        cells_changed += 1
+                        cell_audit.append({"Excel_Row": int(idx) + 2, "Column": col, "Rule_ID": p["rule_id"], "Value_Before": str(val), "Value_After": "NaN"})
+                        if ex_b is None: ex_b, ex_a = str(val), "NaN"
+                if cells_changed > 0:
+                    rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
+                    step_num += 1
+
+    # Step 5: Excel Date Bugs
+    for p_id, p in accepted_prop_map.items():
+        if p["rule_id"] == "repair_dates":
+            col = p["column"]
+            if col in d.columns:
+                cells_changed = 0
+                ex_b, ex_a = None, None
+                for idx in d.index:
+                    val = d.loc[idx, col]
+                    repaired = fix_excel_date_range(val)
+                    if str(val) != str(repaired):
+                        d.loc[idx, col] = repaired
+                        cells_changed += 1
+                        cell_audit.append({"Excel_Row": int(idx) + 2, "Column": col, "Rule_ID": p["rule_id"], "Value_Before": str(val), "Value_After": str(repaired)})
+                        if ex_b is None: ex_b, ex_a = str(val), str(repaired)
+                if cells_changed > 0:
+                    rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
+                    step_num += 1
+
+    # Step 6: Category Clustering
+    for p_id, p in accepted_prop_map.items():
+        if p["rule_id"] == "cluster_categories":
+            col = p["column"]
+            if col in d.columns:
+                mapping = p.get("mapping", {})
+                cells_changed = 0
+                ex_b, ex_a = None, None
+                for idx in d.index:
+                    val = str(d.loc[idx, col]).strip()
+                    if val in mapping:
+                        target = mapping[val]
+                        d.loc[idx, col] = target
+                        cells_changed += 1
+                        cell_audit.append({"Excel_Row": int(idx) + 2, "Column": col, "Rule_ID": p["rule_id"], "Value_Before": str(val), "Value_After": str(target)})
+                        if ex_b is None: ex_b, ex_a = str(val), str(target)
+                if cells_changed > 0:
+                    rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
+                    step_num += 1
+
+    # Step 7: Impossible Values
+    for p_id, p in accepted_prop_map.items():
+        if p["rule_id"] == "impossible_values":
+            col = p["column"]
+            if col in d.columns:
+                min_b, max_b = p.get("bounds", (10, 115))
+                cells_changed = 0
+                ex_b, ex_a = None, None
+                flag_col = f"{col}_out_of_range_flag"
+                d[flag_col] = 0
+                for idx in d.index:
+                    val = pd.to_numeric(d.loc[idx, col], errors="coerce")
+                    if pd.notna(val) and (val < min_b or val > max_b):
+                        d.loc[idx, col] = np.nan
+                        d.loc[idx, flag_col] = 1
+                        cells_changed += 1
+                        cell_audit.append({"Excel_Row": int(idx) + 2, "Column": col, "Rule_ID": p["rule_id"], "Value_Before": str(val), "Value_After": f"NaN (Flagged in {flag_col})"})
+                        if ex_b is None: ex_b, ex_a = str(val), "NaN"
+                if cells_changed > 0:
+                    rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
+                    step_num += 1
+
+    # Step 8: Likert Scale Recoding
+    for p_id, p in accepted_prop_map.items():
+        if p["rule_id"] == "map_likert":
+            col = p["column"]
+            if col in d.columns:
+                cells_changed = 0
+                ex_b, ex_a = None, None
+                col_val_labels = {}
+                for idx in d.index:
+                    val = d.loc[idx, col]
+                    if isinstance(val, str):
+                        v_low = repair_mojibake_encoding(val).strip().lower()
+                        if v_low in LIKERT_TEXT_MAP:
+                            num_code = LIKERT_TEXT_MAP[v_low]
+                            d.loc[idx, col] = num_code
+                            col_val_labels[num_code] = val.strip().title()
+                            cells_changed += 1
+                            cell_audit.append({"Excel_Row": int(idx) + 2, "Column": col, "Rule_ID": p["rule_id"], "Value_Before": str(val), "Value_After": str(num_code)})
+                            if ex_b is None: ex_b, ex_a = str(val), str(num_code)
+                if cells_changed > 0:
+                    d[col] = pd.to_numeric(d[col], errors="coerce")
+                    val_labels[col] = col_val_labels
+                    rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
+                    step_num += 1
+
+    # Step 9: Multi-Select Splitting
+    for p_id, p in accepted_prop_map.items():
+        if p["rule_id"] == "split_multiselect":
+            col = p["column"]
+            if col in d.columns:
+                options = p.get("options", [])
+                for opt in options:
+                    clean_opt = re.sub(r"[^\w]", "_", opt.strip()).strip("_")
+                    opt_col = f"{col}__{clean_opt}"
+                    d[opt_col] = d[col].apply(lambda v: 1 if pd.notna(v) and opt in re.split(r"[;,]\s*", str(v).strip()) else 0)
+                    var_labels[opt_col] = f"{var_labels.get(col, col)} [{opt}]"
+                    val_labels[opt_col] = {0: "Not selected", 1: "Selected"}
+                rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": len(d), "Example_Before": "Multi-select string", "Example_After": f"Expanded {len(options)} binary columns", "Timestamp": now_str})
+                step_num += 1
+
+    # Step 10: Deduplication if accepted
+    if "duplicates::all" in accepted_prop_map:
+        p = accepted_prop_map["duplicates::all"]
+        before_cnt = len(d)
+        d = d.drop_duplicates().reset_index(drop=True)
+        dropped_dups = before_cnt - len(d)
+        if dropped_dups > 0:
+            rule_changelog.append({"Step": step_num, "Rule_ID": "drop_duplicates", "Rule_Name": p["rule_name"], "Column": "(All Columns)", "Cells_Changed": dropped_dups, "Example_Before": "Duplicate Row", "Example_After": "Deduplicated", "Timestamp": now_str})
+            step_num += 1
+
+    # Step 11: Tidy variable names if requested
+    if tidy_names:
+        tidy_cols, name_map = generate_tidy_variable_names(d.columns)
+        new_var_labels = {}
+        for old_c, new_c in zip(d.columns, tidy_cols):
+            new_var_labels[new_c] = var_labels.get(old_c, str(old_c))
+        var_labels = new_var_labels
+        d.columns = tidy_cols
+        rule_changelog.append({"Step": step_num, "Rule_ID": "tidy_names", "Rule_Name": "Standardize Tidy Variable Names", "Column": "(All Columns)", "Cells_Changed": len(d.columns), "Example_Before": "Verbose Question String", "Example_After": "tidy_snake_case", "Timestamp": now_str})
+        step_num += 1
+
+    # Auto-convert purely numeric object columns to proper numeric types
+    for c in d.columns:
+        s = d[c]
+        if isinstance(s, pd.Series) and s.dtype == object:
+            try:
+                s_num = pd.to_numeric(s, errors="raise")
+                d[c] = s_num
+            except (ValueError, TypeError):
+                pass
+
+    df_rules = pd.DataFrame(rule_changelog)
+    df_cells = pd.DataFrame(cell_audit)
+    codebook_meta = {
+        "variable_labels": var_labels,
+        "value_labels": val_labels
+    }
+
+    return {
+        "df_cleaned": d,
+        "df_rule_changelog": df_rules,
+        "df_cell_audit": df_cells,
+        "codebook_metadata": codebook_meta,
+        "is_success": True
+    }
+
+
+def export_formatted_excel_workbook(df_cleaned, codebook_df=None, rule_changelog_df=None, cell_audit_df=None):
+    """
+    Exports a publication-grade, multi-sheet formatted Excel workbook (.xlsx):
+    - Cleaned_Data, Codebook, Change_Log, Cell_Audit_Trail
+    - Frozen row 1 panes, styled navy headers, auto-adjusted column widths,
+      explicit number formats, and formula injection sanitization.
+    """
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    output = io.BytesIO()
+    wb = openpyxl.Workbook()
+    ws_data = wb.active
+    ws_data.title = "Cleaned_Data"
+
+    sheets = [("Cleaned_Data", df_cleaned, ws_data)]
+    if codebook_df is not None and not codebook_df.empty:
+        ws_code = wb.create_sheet("Codebook")
+        sheets.append(("Codebook", codebook_df, ws_code))
+    if rule_changelog_df is not None and not rule_changelog_df.empty:
+        ws_log = wb.create_sheet("Change_Log")
+        sheets.append(("Change_Log", rule_changelog_df, ws_log))
+    if cell_audit_df is not None and not cell_audit_df.empty:
+        ws_audit = wb.create_sheet("Cell_Audit_Trail")
+        sheets.append(("Cell_Audit_Trail", cell_audit_df, ws_audit))
+
+    header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
+    data_font = Font(name="Segoe UI", size=10)
+    thin_border = Border(
+        left=Side(style='thin', color='E5E7EB'),
+        right=Side(style='thin', color='E5E7EB'),
+        top=Side(style='thin', color='E5E7EB'),
+        bottom=Side(style='thin', color='E5E7EB')
+    )
+
+    for s_name, df_s, ws in sheets:
+        ws.freeze_panes = "A2"
+        # Header Row
+        for col_idx, col_name in enumerate(df_s.columns, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=str(col_name))
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        # Data Rows
+        for row_idx, row in enumerate(df_s.itertuples(index=False), start=2):
+            for col_idx, val in enumerate(row, start=1):
+                # Sanitize formula injection
+                if isinstance(val, str) and len(val) > 0 and val[0] in ('=', '+', '-', '@', '\t', '\r', '\n'):
+                    safe_val = "'" + val
+                elif pd.isna(val):
+                    safe_val = None
+                else:
+                    safe_val = val
+
+                c = ws.cell(row=row_idx, column=col_idx, value=safe_val)
+                c.font = data_font
+                c.border = thin_border
+                if isinstance(safe_val, float):
+                    c.number_format = "0.000" if abs(safe_val - round(safe_val, 2)) > 1e-4 else "0.00"
+                elif isinstance(safe_val, int):
+                    c.number_format = "#,##0"
+
+        # Auto column widths
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col[:120]:
+                v_str = str(cell.value or "")
+                if len(v_str) > max_len:
+                    max_len = len(v_str)
+            ws.column_dimensions[col_letter].width = max(12, min(max_len + 4, 48))
+
+    wb.save(output)
+    return output.getvalue()
+
+
+def export_spss_stata_bytes(df_cleaned, variable_labels=None, value_labels=None, fmt="sav"):
+    """
+    Exports binary SPSS (.sav) or Stata (.dta) files with preserved variable and value labels.
+    """
+    import tempfile
+    import pyreadstat
+
+    # Ensure clean variable names for SPSS/Stata compatibility (no spaces or special chars)
+    df_export = df_cleaned.copy()
+    clean_cols = []
+    col_mapping = {}
+    for col in df_export.columns:
+        c_clean = re.sub(r"[^\w]", "_", str(col).strip()).strip("_")
+        if not c_clean or c_clean[0].isdigit():
+            c_clean = f"v_{c_clean}"
+        clean_cols.append(c_clean)
+        col_mapping[str(col)] = c_clean
+    clean_cols = make_columns_unique(clean_cols)
+    df_export.columns = clean_cols
+
+    # Map variable labels
+    var_labels_mapped = {}
+    if variable_labels:
+        for old_c, lbl in variable_labels.items():
+            new_c = col_mapping.get(str(old_c), str(old_c))
+            var_labels_mapped[new_c] = str(lbl)[:250]
+
+    # Map value labels
+    val_labels_mapped = {}
+    if value_labels:
+        for old_c, lbl_dict in value_labels.items():
+            new_c = col_mapping.get(str(old_c), str(old_c))
+            clean_dict = {}
+            for k, v in lbl_dict.items():
+                try:
+                    clean_dict[float(k)] = str(v)
+                except (ValueError, TypeError):
+                    clean_dict[str(k)] = str(v)
+            val_labels_mapped[new_c] = clean_dict
+
+    suffix = ".sav" if fmt == "sav" else ".dta"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        tmp_path = f.name
+
+    try:
+        if fmt == "sav":
+            pyreadstat.write_sav(
+                df_export,
+                tmp_path,
+                column_labels=var_labels_mapped if var_labels_mapped else None,
+                variable_value_labels=val_labels_mapped if val_labels_mapped else None
+            )
+        else:
+            pyreadstat.write_dta(
+                df_export,
+                tmp_path,
+                column_labels=var_labels_mapped if var_labels_mapped else None,
+                variable_value_labels=val_labels_mapped if val_labels_mapped else None
+            )
+        with open(tmp_path, "rb") as f_read:
+            data_bytes = f_read.read()
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    return data_bytes
+
+
+def format_apa7_table_html(df, table_num="Table 1", title="Descriptive Statistics and Model Properties", note=None):
+    """
+    Renders publication-ready APA 7th Edition formatted tables in HTML with standard horizontal rules.
+    """
+    stat_patterns = {
+        r"\bM\b": "<i>M</i>",
+        r"\bSD\b": "<i>SD</i>",
+        r"\bSE\b": "<i>SE</i>",
+        r"\bt\b": "<i>t</i>",
+        r"\bF\b": "<i>F</i>",
+        r"\bp\b": "<i>p</i>",
+        r"\br\b": "<i>r</i>",
+        r"\bz\b": "<i>z</i>",
+        r"\bB\b": "<i>B</i>",
+        r"\bN\b": "<i>N</i>",
+        r"\bdf\b": "<i>df</i>",
+        r"\bCI\b": "<i>CI</i>",
+        r"α": "<i>α</i>",
+        r"ω": "<i>ω</i>",
+        r"χ²": "<i>χ</i>²",
+    }
+    headers_html = []
+    for c in df.columns:
+        c_str = str(c)
+        for pat, repl in stat_patterns.items():
+            c_str = re.sub(pat, repl, c_str)
+        headers_html.append(f"<th style='padding: 6px 12px; border-bottom: 1px solid #111; font-weight: 600;'>{c_str}</th>")
+
+    rows_html = []
+    for _, row in df.iterrows():
+        cells = []
+        for i, val in enumerate(row):
+            align = "left" if i == 0 else "right"
+            val_str = f"{val:.3f}" if isinstance(val, float) else str(val if pd.notna(val) else "-")
+            cells.append(f"<td style='padding: 5px 12px; text-align: {align}; border: none;'>{val_str}</td>")
+        rows_html.append("<tr>" + "".join(cells) + "</tr>")
+
+    note_html = f"<div style='font-size: 0.85rem; margin-top: 6px; color: #4B5563;'><i>Note.</i> {note}</div>" if note else ""
+
+    html = f"""
+    <div style="font-family: 'Times New Roman', Times, serif; color: #111; margin: 16px 0;">
+        <div style="font-weight: bold; font-size: 1rem;">{table_num}</div>
+        <div style="font-style: italic; font-size: 0.95rem; margin-bottom: 8px;">{title}</div>
+        <table style="border-collapse: collapse; width: 100%; border-top: 2px solid #111; border-bottom: 2px solid #111; font-size: 0.9rem;">
+            <thead><tr>{"".join(headers_html)}</tr></thead>
+            <tbody>{"".join(rows_html)}</tbody>
+        </table>
+        {note_html}
+    </div>
+    """
+    return html
+
+
 def compute_cronbach_alpha(df_items, use_pairwise_if_needed=True):
     """
     Compute Cronbach's alpha on a DataFrame of numeric items.
