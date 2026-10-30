@@ -1972,35 +1972,41 @@ elif app_mode.startswith("🔍"):
                 type="primary"
             )
         with exp2:
-            spss_bytes = engine.export_spss_stata_bytes(
-                df_cleaned,
-                variable_labels=export_meta.get("variable_labels"),
-                value_labels=export_meta.get("value_labels"),
-                fmt="sav"
-            )
-            st.download_button(
-                "📈 SPSS Dataset (.sav)",
-                data=spss_bytes,
-                file_name=f"Cleaned_{base_fname}.sav",
-                mime="application/x-spss-sav",
-                help="Binary SPSS file with embedded variable labels and value labels.",
-                use_container_width=True
-            )
+            try:
+                spss_bytes = engine.export_spss_stata_bytes(
+                    df_cleaned,
+                    variable_labels=export_meta.get("variable_labels"),
+                    value_labels=export_meta.get("value_labels"),
+                    fmt="sav"
+                )
+                st.download_button(
+                    "📈 SPSS Dataset (.sav)",
+                    data=spss_bytes,
+                    file_name=f"Cleaned_{base_fname}.sav",
+                    mime="application/x-spss-sav",
+                    help="Binary SPSS file with embedded variable labels and value labels.",
+                    use_container_width=True
+                )
+            except Exception as e_spss:
+                st.info(f"SPSS (.sav) export: {e_spss}")
         with exp3:
-            stata_bytes = engine.export_spss_stata_bytes(
-                df_cleaned,
-                variable_labels=export_meta.get("variable_labels"),
-                value_labels=export_meta.get("value_labels"),
-                fmt="dta"
-            )
-            st.download_button(
-                "📉 Stata Dataset (.dta)",
-                data=stata_bytes,
-                file_name=f"Cleaned_{base_fname}.dta",
-                mime="application/x-stata-dta",
-                help="Binary Stata file with embedded variable labels and value labels.",
-                use_container_width=True
-            )
+            try:
+                stata_bytes = engine.export_spss_stata_bytes(
+                    df_cleaned,
+                    variable_labels=export_meta.get("variable_labels"),
+                    value_labels=export_meta.get("value_labels"),
+                    fmt="dta"
+                )
+                st.download_button(
+                    "📉 Stata Dataset (.dta)",
+                    data=stata_bytes,
+                    file_name=f"Cleaned_{base_fname}.dta",
+                    mime="application/x-stata-dta",
+                    help="Binary Stata file with embedded variable labels and value labels.",
+                    use_container_width=True
+                )
+            except Exception as e_stata:
+                st.info(f"Stata (.dta) export: {e_stata}")
         with exp4:
             st.download_button(
                 "📑 Cleaned CSV (UTF-8)",

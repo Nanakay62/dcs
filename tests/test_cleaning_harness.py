@@ -197,3 +197,42 @@ def test_formatted_excel_and_spss_stata_exports():
     # 3. Stata (.dta) export with labels
     dta_bytes = engine.export_spss_stata_bytes(df_clean, var_labels, val_labels, fmt="dta")
     assert len(dta_bytes) > 500
+
+
+def test_spss_stata_long_variable_names_and_labels_resilience():
+    """
+    Verifies that export_spss_stata_bytes handles 100+ character variable names
+    and 150+ character labels without throwing ReadstatError (name/label too long).
+    """
+    long_cols = [
+        "How satisfied are you with your manager communication regarding daily tasks and goals in 2026?",
+        "How satisfied are you with your manager communication regarding weekly tasks and goals in 2026?",
+        "What is your overall assessment of cross-functional team collaboration throughout the entire organization?",
+    ]
+    long_labels = {c: f"Detailed verbatim question header text for {c}: This exceeds 80 characters substantially!" for c in long_cols}
+    val_labels = {long_cols[0]: {1: "Strongly Disagree", 5: "Strongly Agree"}}
+    df_long = pd.DataFrame({c: [1, 2, 3] for c in long_cols})
+
+    # Both SPSS and Stata exports must succeed without throwing ReadstatError
+    sav_b = engine.export_spss_stata_bytes(df_long, long_labels, val_labels, fmt="sav")
+    assert len(sav_b) > 500
+
+    dta_b = engine.export_spss_stata_bytes(df_long, long_labels, val_labels, fmt="dta")
+    assert len(dta_b) > 500
+
+    # Read back to verify columns were sanitized to <= 32 chars in Stata
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".dta", delete=False) as f:
+        f.write(dta_b)
+        tmp = f.name
+    try:
+        df_r, meta = pyreadstat.read_dta(tmp)
+        assert len(df_r.columns) == 3
+        for col_name in df_r.columns:
+            assert len(col_name) <= 32
+        for lbl in meta.column_labels:
+            assert len(lbl) <= 80
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+

@@ -2189,46 +2189,84 @@ def export_formatted_excel_workbook(df_cleaned, codebook_df=None, rule_changelog
 def export_spss_stata_bytes(df_cleaned, variable_labels=None, value_labels=None, fmt="sav"):
     """
     Exports binary SPSS (.sav) or Stata (.dta) files with preserved variable and value labels.
+    Guarantees strict compliance with Stata (32-char col / 80-char label) and
+    SPSS (64-char col / 255-char label) format specifications.
     """
     import tempfile
     import pyreadstat
 
-    # Ensure clean variable names for SPSS/Stata compatibility (no spaces or special chars)
     df_export = df_cleaned.copy()
+
+    # Stata allows max 32 chars for var name and 80 chars for var label.
+    # SPSS allows max 64 chars for var name and 255 chars for var label.
+    max_col_len = 32 if fmt == "dta" else 64
+    max_label_len = 80 if fmt == "dta" else 255
+    base_max = max_col_len - 4
+
+    # 1. Sanitize column names
     clean_cols = []
-    col_mapping = {}
-    for col in df_export.columns:
+    for idx, col in enumerate(df_export.columns):
         c_clean = re.sub(r"[^\w]", "_", str(col).strip()).strip("_")
         if not c_clean or c_clean[0].isdigit():
             c_clean = f"v_{c_clean}"
+        c_clean = c_clean[:base_max].rstrip("_")
+        if not c_clean:
+            c_clean = f"v_{idx+1}"
         clean_cols.append(c_clean)
-        col_mapping[str(col)] = c_clean
-    clean_cols = make_columns_unique(clean_cols)
-    df_export.columns = clean_cols
 
-    # Map variable labels
+    # Ensure uniqueness while strictly enforcing max length
+    seen = {}
+    unique_cols = []
+    for col in clean_cols:
+        if col not in seen:
+            seen[col] = 1
+            unique_cols.append(col)
+        else:
+            cnt = seen[col]
+            suffix = f"_{cnt}"
+            prefix = col[:max_col_len - len(suffix)].rstrip("_")
+            new_col = f"{prefix}{suffix}"
+            while new_col in seen:
+                cnt += 1
+                suffix = f"_{cnt}"
+                prefix = col[:max_col_len - len(suffix)].rstrip("_")
+                new_col = f"{prefix}{suffix}"
+            seen[col] = cnt + 1
+            seen[new_col] = 1
+            unique_cols.append(new_col)
+
+    col_mapping = dict(zip([str(c) for c in df_cleaned.columns], unique_cols))
+    df_export.columns = unique_cols
+
+    # 2. Map and truncate variable labels
     var_labels_mapped = {}
     if variable_labels:
         for old_c, lbl in variable_labels.items():
-            new_c = col_mapping.get(str(old_c), str(old_c))
-            var_labels_mapped[new_c] = str(lbl)[:250]
+            new_c = col_mapping.get(str(old_c))
+            if new_c and pd.notna(lbl):
+                var_labels_mapped[new_c] = str(lbl)[:max_label_len]
 
-    # Map value labels
+    # 3. Map and truncate value labels
     val_labels_mapped = {}
     if value_labels:
         for old_c, lbl_dict in value_labels.items():
-            new_c = col_mapping.get(str(old_c), str(old_c))
-            clean_dict = {}
-            for k, v in lbl_dict.items():
-                try:
-                    clean_dict[float(k)] = str(v)
-                except (ValueError, TypeError):
-                    clean_dict[str(k)] = str(v)
-            val_labels_mapped[new_c] = clean_dict
+            new_c = col_mapping.get(str(old_c))
+            if new_c and isinstance(lbl_dict, dict):
+                clean_dict = {}
+                for k, v in lbl_dict.items():
+                    val_str = str(v)[:max_label_len]
+                    try:
+                        clean_dict[float(k)] = val_str
+                    except (ValueError, TypeError):
+                        if fmt == "sav":
+                            clean_dict[str(k)] = val_str
+                if clean_dict:
+                    val_labels_mapped[new_c] = clean_dict
 
     suffix = ".sav" if fmt == "sav" else ".dta"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
         tmp_path = f.name
+    f.close()
 
     try:
         if fmt == "sav":
@@ -2239,12 +2277,24 @@ def export_spss_stata_bytes(df_cleaned, variable_labels=None, value_labels=None,
                 variable_value_labels=val_labels_mapped if val_labels_mapped else None
             )
         else:
+            stata_val_labels = {}
+            for col_name, vdict in val_labels_mapped.items():
+                num_vdict = {}
+                for k, v in vdict.items():
+                    try:
+                        num_vdict[int(float(k))] = str(v)[:80]
+                    except (ValueError, TypeError):
+                        pass
+                if num_vdict:
+                    stata_val_labels[col_name] = num_vdict
+
             pyreadstat.write_dta(
                 df_export,
                 tmp_path,
                 column_labels=var_labels_mapped if var_labels_mapped else None,
-                variable_value_labels=val_labels_mapped if val_labels_mapped else None
+                variable_value_labels=stata_val_labels if stata_val_labels else None
             )
+
         with open(tmp_path, "rb") as f_read:
             data_bytes = f_read.read()
     finally:
