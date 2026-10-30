@@ -18,7 +18,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+import importlib
 import engine
+
+# Ensure engine module is always freshly synchronized with disk in long-running Streamlit servers
+try:
+    importlib.reload(engine)
+except Exception:
+    pass
 
 WORKSPACE = Path(__file__).parent.resolve()
 DEFAULT_EXCEL = WORKSPACE / "Masterfile_2_English.xlsx"
@@ -784,16 +791,27 @@ elif app_mode.startswith("🔍"):
         except Exception:
             pass
 
+    FormatError = getattr(engine, "DCSFileFormatError", Exception)
     if df_raw_sheet is None:
         try:
             if hasattr(uploaded_general, "seek"):
                 uploaded_general.seek(0)
-            df_raw_sheet, load_meta = engine.robust_load_spreadsheet(
-                uploaded_general, uploaded_general.name, sheet_name=chosen_sheet
-            )
+            if hasattr(engine, "robust_load_spreadsheet"):
+                df_raw_sheet, load_meta = engine.robust_load_spreadsheet(
+                    uploaded_general, uploaded_general.name, sheet_name=chosen_sheet
+                )
+            elif uploaded_general.name.endswith(".csv"):
+                df_raw_sheet = pd.read_csv(uploaded_general, header=None)
+                load_meta = {"hidden_sheets": [], "unmerged_cells_count": 0}
+            else:
+                df_raw_sheet = pd.read_excel(uploaded_general, sheet_name=chosen_sheet or 0, header=None)
+                load_meta = {"hidden_sheets": [], "unmerged_cells_count": 0}
             file_display_name = f"{uploaded_general.name} [{chosen_sheet}]" if chosen_sheet else uploaded_general.name
-        except engine.DCSFileFormatError as err:
+        except FormatError as err:
             st.error(f"❌ **File Ingestion Error**: {err}")
+            st.stop()
+        except Exception as err:
+            st.error(f"❌ **File Loading Error**: {err}")
             st.stop()
 
     if load_meta.get("hidden_sheets"):
@@ -2008,15 +2026,18 @@ elif app_mode.startswith("🔍"):
             else:
                 st.info("No cell changes logged yet")
         with exp6:
-            sha_raw = engine.compute_df_sha256(df_raw_sheet)
-            sha_clean = engine.compute_df_sha256(df_cleaned)
-            py_code = engine.generate_reproducible_python_script(
-                df_raw_sheet,
-                accepted_proposals=st.session_state.get(f"accepted_props_{uploaded_general.name}", prop_res["proposals"]),
-                source_sha256=sha_raw,
-                output_sha256=sha_clean,
-                version="1.1.0"
-            )
+            sha_raw = engine.compute_df_sha256(df_raw_sheet) if hasattr(engine, "compute_df_sha256") else ""
+            sha_clean = engine.compute_df_sha256(df_cleaned) if hasattr(engine, "compute_df_sha256") else ""
+            if hasattr(engine, "generate_reproducible_python_script"):
+                py_code = engine.generate_reproducible_python_script(
+                    df_raw_sheet,
+                    accepted_proposals=st.session_state.get(f"accepted_props_{uploaded_general.name}", prop_res["proposals"]),
+                    source_sha256=sha_raw,
+                    output_sha256=sha_clean,
+                    version="1.1.0"
+                )
+            else:
+                py_code = engine.generate_reproducible_script(uploaded_general.name, cleaning_options)
             st.download_button(
                 "🐍 Replay Python Pipeline (.py)",
                 data=py_code.encode("utf-8"),
