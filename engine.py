@@ -440,6 +440,56 @@ def detect_header_row(df_raw, max_scan=10):
     return best_row
 
 
+def detect_multi_header_rows(df_raw, max_scan=10):
+    """
+    Detects whether a generic sheet uses a single header row [h_idx] or a 2-row
+    stacked header [r_top, r_bot] (e.g., Row 0 = Category/Group, Row 1 = Sub-header).
+    Avoids false positives on single-cell sheet title banners or normal data rows.
+    """
+    h_idx = detect_header_row(df_raw, max_scan=max_scan)
+    if df_raw is None or df_raw.empty or df_raw.shape[1] < 2 or len(df_raw) < 3:
+        return [h_idx]
+
+    def _is_pure_label_row(r_idx):
+        row_vals = df_raw.iloc[r_idx].dropna()
+        if len(row_vals) < 2:
+            return False, []
+        strs = []
+        for v in row_vals:
+            if not isinstance(v, str):
+                return False, []
+            s = clean_text_hygiene(v)
+            if not s or len(s) > 60:
+                return False, []
+            s_low = s.lower()
+            if s_low in SENTINEL_VALUES or s_low in LIKERT_TEXT_MAP:
+                return False, []
+            if pd.notna(pd.to_numeric(s, errors="coerce")):
+                return False, []
+            if re.match(r"^\d{4}-\d{2}-\d{2}", s) or re.match(r"^(?:resp|id|user|part)[_-]?\d+$", s_low):
+                return False, []
+            strs.append(s)
+        return True, strs
+
+    # Case 1: h_idx >= 1 and row (h_idx - 1) is a multi-category parent header row
+    if h_idx >= 1 and (h_idx + 1) < len(df_raw):
+        ok_top, top_strs = _is_pure_label_row(h_idx - 1)
+        ok_bot, bot_strs = _is_pure_label_row(h_idx)
+        if ok_top and ok_bot and len(set(top_strs)) >= 2 and len(bot_strs) >= (df_raw.shape[1] * 0.5):
+            if len(top_strs) > len(set(top_strs)) or len(top_strs) < len(bot_strs):
+                return [h_idx - 1, h_idx]
+
+    # Case 2: h_idx is the parent header row and (h_idx + 1) is the sub-header row above data at (h_idx + 2)
+    if (h_idx + 2) < len(df_raw):
+        ok_top, top_strs = _is_pure_label_row(h_idx)
+        ok_bot, bot_strs = _is_pure_label_row(h_idx + 1)
+        if ok_top and ok_bot and len(set(top_strs)) >= 2 and len(bot_strs) >= (df_raw.shape[1] * 0.5):
+            if len(top_strs) > len(set(top_strs)) and len(set(bot_strs)) > len(set(top_strs)):
+                return [h_idx, h_idx + 1]
+
+    return [h_idx]
+
+
 def merge_multi_headers(df_raw, header_indices=[0, 1]):
     """
     Combines stacked header rows (e.g. Row 0 = Category, Row 1 = Subcategory)
@@ -482,14 +532,16 @@ def detect_and_strip_stacked_tables(df_raw):
         if len(non_null) == 0:
             continue
 
-        # Check for single-cell banner title
-        if len(non_null) == 1 and isinstance(non_null.iloc[0], str) and len(non_null.iloc[0].strip()) > 1:
-            current_section = clean_text_hygiene(non_null.iloc[0])
-            rows_to_drop.append(idx)
-            continue
+        # Check for single-cell banner title (only when table has >1 column)
+        if d.shape[1] > 1 and len(non_null) == 1 and isinstance(non_null.iloc[0], str) and len(non_null.iloc[0].strip()) > 1:
+            val_clean = clean_text_hygiene(non_null.iloc[0])
+            if val_clean and not any(k in val_clean.lower() for k in SUMMARY_KEYWORDS):
+                current_section = val_clean
+                rows_to_drop.append(idx)
+                continue
 
         # Check if row is a repeated header (matching column names)
-        row_strs = [clean_text_hygiene(v).lower() for v in non_null if isinstance(v, str)]
+        row_strs = [clean_text_hygiene(v).lower() for v in non_null if isinstance(v, str) and clean_text_hygiene(v)]
         matches = sum(1 for s in row_strs if s in col_names)
         if len(row_strs) >= 3 and matches >= (len(row_strs) * 0.6):
             rows_to_drop.append(idx)
@@ -527,14 +579,18 @@ def strip_summary_rows(df_raw):
 
 def consolidate_multisheet_excel(excel_file_or_bytes, sheet_names=None):
     """
-    Reads multiple sheets from an Excel workbook and consolidates them into a single dataframe
+    Reads multiple sheets from an Excel workbook (.xlsx or .xls) and consolidates them into a single dataframe
     with a `source_sheet` column.
     """
+    if hasattr(excel_file_or_bytes, "seek"):
+        excel_file_or_bytes.seek(0)
     xl = pd.ExcelFile(excel_file_or_bytes)
     targets = sheet_names if sheet_names else xl.sheet_names
     dfs = []
 
     for name in targets:
+        if hasattr(excel_file_or_bytes, "seek"):
+            excel_file_or_bytes.seek(0)
         sub_df = pd.read_excel(excel_file_or_bytes, sheet_name=name)
         sub_df["source_sheet"] = name
         dfs.append(sub_df)
@@ -571,10 +627,11 @@ def xray_inspect_spreadsheet(df_raw):
 
     # 2. Section banners
     banner_rows = []
-    for idx in df_raw.index:
-        non_null = df_raw.iloc[idx].dropna()
-        if len(non_null) == 1 and isinstance(non_null.iloc[0], str) and len(non_null.iloc[0].strip()) > 1:
-            banner_rows.append((idx, non_null.iloc[0].strip()))
+    if total_cols > 1:
+        for idx in df_raw.index:
+            non_null = df_raw.iloc[idx].dropna()
+            if len(non_null) == 1 and isinstance(non_null.iloc[0], str) and len(non_null.iloc[0].strip()) > 1:
+                banner_rows.append((idx, non_null.iloc[0].strip()))
 
     # 3. Summary / subtotal rows
     summary_rows = []
@@ -960,13 +1017,16 @@ def detect_unmapped_survey_phrases(series, known_dictionary=None):
 
 def robust_load_spreadsheet(file_obj_or_bytes, filename, sheet_name=None):
     """
-    Robustly loads CSV or Excel files with:
+    Robustly loads CSV/TSV or Excel (.xlsx, .xls) files with:
     - Automatic BOM detection and stripping (utf-8-sig)
     - Fallback encoding detection (utf-8, cp1252, latin1)
-    - Excel merged-cell unmerging & flattening with warnings
+    - Automatic CSV/TSV delimiter sniffing (',', ';', '\\t', '|')
+    - Excel (.xlsx via openpyxl and legacy .xls via xlrd) merged-cell unmerging & flattening
     - Hidden sheet and multi-sheet inspection
     - Loud failure on truncation or corruption (no silent drops)
     """
+    import csv
+
     if hasattr(file_obj_or_bytes, "read"):
         if hasattr(file_obj_or_bytes, "seek"):
             file_obj_or_bytes.seek(0)
@@ -978,10 +1038,12 @@ def robust_load_spreadsheet(file_obj_or_bytes, filename, sheet_name=None):
         raise DCSFileFormatError(f"Uploaded file '{filename}' is empty (0 bytes).")
 
     fname_lower = filename.lower()
+    is_csv_like = fname_lower.endswith((".csv", ".tsv", ".txt"))
     metadata = {
         "filename": filename,
-        "format": "csv" if fname_lower.endswith(".csv") else "excel",
+        "format": "csv" if is_csv_like else "excel",
         "encoding_used": None,
+        "delimiter_used": "," if is_csv_like else None,
         "sheets": [],
         "hidden_sheets": [],
         "unmerged_cells_count": 0,
@@ -989,20 +1051,48 @@ def robust_load_spreadsheet(file_obj_or_bytes, filename, sheet_name=None):
         "cols_loaded": 0
     }
 
-    if fname_lower.endswith(".csv"):
+    if is_csv_like:
         encodings_to_try = []
         if raw_bytes.startswith(b"\xef\xbb\xbf"):
             encodings_to_try = ["utf-8-sig", "utf-8", "cp1252", "latin1"]
         else:
             encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
 
+        def _detect_csv_delimiter(sample_text, fname):
+            if fname.endswith(".tsv"):
+                return "\t"
+            lines = [ln for ln in sample_text.splitlines() if ln.strip()][:15]
+            if not lines:
+                return ","
+            # Check standard comma first; if comma splits into >= 2 columns consistently, prefer ','
+            comma_counts = [len(next(csv.reader([ln], delimiter=","))) for ln in lines]
+            if max(comma_counts) >= 2:
+                # Also check if semicolon or tab splits into strictly more consistent columns when comma has 0 in header
+                if comma_counts[0] >= 2:
+                    return ","
+            for cand in [";", "\t", "|", ","]:
+                try:
+                    counts = [len(next(csv.reader([ln], delimiter=cand))) for ln in lines]
+                    if counts[0] >= 2 and min(counts) >= 2:
+                        return cand
+                except Exception:
+                    continue
+            try:
+                dialect = csv.Sniffer().sniff("\n".join(lines), delimiters=",;\t|")
+                return dialect.delimiter
+            except Exception:
+                return ","
+
         df = None
         last_err = None
         for enc in encodings_to_try:
             try:
+                sample_str = raw_bytes[:16384].decode(enc)
+                sep = _detect_csv_delimiter(sample_str, fname_lower)
                 buf = io.BytesIO(raw_bytes)
-                df = pd.read_csv(buf, encoding=enc, header=None)
+                df = pd.read_csv(buf, encoding=enc, sep=sep, header=None)
                 metadata["encoding_used"] = enc
+                metadata["delimiter_used"] = sep
                 break
             except Exception as e:
                 last_err = e
@@ -1016,6 +1106,70 @@ def robust_load_spreadsheet(file_obj_or_bytes, filename, sheet_name=None):
         return df, metadata
 
     else:
+        is_biff_xls = fname_lower.endswith(".xls") or raw_bytes[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+        if is_biff_xls and not raw_bytes[:4] == b"PK\x03\x04":
+            try:
+                import xlrd
+                try:
+                    wb = xlrd.open_workbook(file_contents=raw_bytes, formatting_info=True)
+                except Exception:
+                    wb = xlrd.open_workbook(file_contents=raw_bytes)
+            except Exception as e:
+                raise DCSFileFormatError(f"Corrupted or invalid legacy .xls file '{filename}': {e}")
+
+            sheet_names = wb.sheet_names()
+            hidden_sheets = []
+            for s_name in sheet_names:
+                sh_check = wb.sheet_by_name(s_name)
+                if getattr(sh_check, "visibility", 0) != 0:
+                    hidden_sheets.append(s_name)
+
+            metadata["sheets"] = sheet_names
+            metadata["hidden_sheets"] = hidden_sheets
+
+            chosen = sheet_name or sheet_names[0]
+            if chosen not in sheet_names:
+                raise DCSFileFormatError(f"Requested worksheet '{chosen}' not found in workbook {sheet_names}.")
+
+            ws = wb.sheet_by_name(chosen)
+            if ws.nrows == 0 or ws.ncols == 0:
+                raise DCSFileFormatError(f"Worksheet '{chosen}' in '{filename}' contains no data rows.")
+
+            data = []
+            for r in range(ws.nrows):
+                row_vals = []
+                for c in range(ws.ncols):
+                    cell = ws.cell(r, c)
+                    val = cell.value
+                    if cell.ctype == xlrd.XL_CELL_EMPTY:
+                        val = None
+                    elif cell.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            val = xlrd.xldate_as_datetime(val, wb.datemode)
+                        except Exception:
+                            pass
+                    elif cell.ctype == xlrd.XL_CELL_NUMBER and isinstance(val, float) and val.is_integer():
+                        val = int(val)
+                    elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                        val = bool(val)
+                    row_vals.append(val)
+                data.append(row_vals)
+
+            unmerged_count = 0
+            for (rlo, rhi, clo, chi) in getattr(ws, "merged_cells", []):
+                top_left_val = data[rlo][clo]
+                for r in range(rlo, min(rhi, ws.nrows)):
+                    for c in range(clo, min(chi, ws.ncols)):
+                        data[r][c] = top_left_val
+                        unmerged_count += 1
+
+            metadata["unmerged_cells_count"] = unmerged_count
+            df = pd.DataFrame(data)
+            metadata["rows_loaded"] = len(df)
+            metadata["cols_loaded"] = df.shape[1]
+            return df, metadata
+
         try:
             import openpyxl
             wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
@@ -1116,7 +1270,11 @@ def generate_reproducible_python_script(df_raw, accepted_proposals, source_sha25
         lines.append(f"    # --- Rule: {p.get('rule_name', rule_id)} (Target: {col}) ---")
 
         if rule_id == "drop_blanks":
-            lines.append("    df = df.dropna(how='all')")
+            lines.append("    df = df.dropna(how='all').reset_index(drop=True)")
+
+        elif rule_id == "strip_stacked":
+            lines.append("    from engine import detect_and_strip_stacked_tables")
+            lines.append("    df = detect_and_strip_stacked_tables(df)")
 
         elif rule_id == "drop_summaries":
             lines.append("    summary_words = ['total', 'subtotal', 'average', 'summary', 'genomsnitt', 'summa']")
@@ -1126,7 +1284,7 @@ def generate_reproducible_python_script(df_raw, accepted_proposals, source_sha25
             lines.append("        if any(w in row_txt for w in summary_words):")
             lines.append("            drop_idx.append(idx)")
             lines.append("    if drop_idx:")
-            lines.append("        df = df.drop(index=drop_idx)")
+            lines.append("        df = df.drop(index=drop_idx).reset_index(drop=True)")
 
         elif rule_id == "clean_sentinels":
             lines.append(f"    if '{col}' in df.columns:")
@@ -1134,11 +1292,21 @@ def generate_reproducible_python_script(df_raw, accepted_proposals, source_sha25
             lines.append(f"        mask = df['{col}'].astype(str).str.strip().str.lower().isin(sentinels)")
             lines.append(f"        df.loc[mask, '{col}'] = np.nan")
 
+        elif rule_id == "repair_dates":
+            lines.append(f"    if '{col}' in df.columns:")
+            lines.append("        from engine import fix_excel_date_range")
+            lines.append(f"        df['{col}'] = df['{col}'].apply(fix_excel_date_range)")
+
         elif rule_id == "repair_mojibake":
             lines.append(f"    if '{col}' in df.columns:")
             lines.append("        replacements = {'Ã¤': 'ä', 'Ã¶': 'ö', 'Ã¥': 'å', 'Ã„': 'Ä', 'Ã–': 'Ö', 'Ã…': 'Å', 'Ã©': 'é', 'â€™': '’', 'â€“': '–', '\u00a0': ' '}")
             lines.append(f"        for bad, good in replacements.items():")
             lines.append(f"            df['{col}'] = df['{col}'].astype(str).str.replace(bad, good, regex=False)")
+
+        elif rule_id == "trim_strings":
+            lines.append(f"    if '{col}' in df.columns:")
+            lines.append("        from engine import clean_text_hygiene")
+            lines.append(f"        df['{col}'] = df['{col}'].apply(clean_text_hygiene)")
 
         elif rule_id == "cluster_categories":
             mapping = p.get("mapping", {})
@@ -1152,6 +1320,11 @@ def generate_reproducible_python_script(df_raw, accepted_proposals, source_sha25
             lines.append("        from engine import LIKERT_TEXT_MAP")
             lines.append(f"        s_clean = df['{col}'].astype(str).str.strip().str.lower()")
             lines.append(f"        df['{col}'] = s_clean.map(lambda v: LIKERT_TEXT_MAP.get(v, v))")
+
+        elif rule_id == "parse_numbers":
+            lines.append(f"    if '{col}' in df.columns:")
+            lines.append("        from engine import parse_numeric_cell")
+            lines.append(f"        df['{col}'] = pd.to_numeric(df['{col}'].apply(parse_numeric_cell), errors='coerce')")
 
         elif rule_id == "impossible_values":
             bounds = p.get("bounds")
@@ -1174,7 +1347,7 @@ def generate_reproducible_python_script(df_raw, accepted_proposals, source_sha25
             lines.append(f"            df[new_col] = df['{col}'].astype(str).apply(lambda v: 1 if opt in v else 0)")
 
         elif rule_id == "flag_duplicates":
-            lines.append("    df = df.drop_duplicates(keep='first')")
+            lines.append("    df = df.drop_duplicates(keep='first').reset_index(drop=True)")
 
         lines.append("")
 
@@ -1229,7 +1402,7 @@ def repair_mojibake_encoding(val):
     for bad, good in replacements.items():
         if bad in s:
             s = s.replace(bad, good)
-    return s.strip()
+    return s
 
 
 def cluster_near_duplicate_categories(series, threshold=0.82):
@@ -1614,8 +1787,20 @@ def apply_import_profile(df_raw, profile="auto", filter_preview=True):
         }
 
     else:
-        # Generic flat table
-        h_idx = detect_header_row(d)
+        # Generic flat or multi-header table
+        h_indices = detect_multi_header_rows(d)
+        if len(h_indices) > 1:
+            d_data = merge_multi_headers(d, h_indices)
+            for col in d_data.columns:
+                var_labels[col] = str(col)
+            return {
+                "df": d_data,
+                "variable_labels": var_labels,
+                "profile": "generic",
+                "headers_stripped": max(h_indices) + 1
+            }
+
+        h_idx = h_indices[0]
         raw_headers = [clean_text_hygiene(str(v)) if pd.notna(v) and clean_text_hygiene(str(v)) else f"Column_{i+1}" for i, v in enumerate(d.iloc[h_idx])]
         unique_headers = make_columns_unique(raw_headers)
         d_data = d.iloc[h_idx + 1:].copy().reset_index(drop=True)
@@ -1690,11 +1875,13 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
 
     # 2. Subtotal & Summary Rows
     summary_indices = []
+    summary_idx_set = set()
     for idx in df_raw.index:
         first_few = [str(df_raw.iloc[idx, c]).strip().lower() for c in range(min(5, n_cols)) if pd.notna(df_raw.iloc[idx, c])]
         for text_val in first_few:
             if any(k in text_val for k in SUMMARY_KEYWORDS):
                 summary_indices.append((idx, text_val))
+                summary_idx_set.add(idx)
                 break
     if summary_indices:
         defect_cells += len(summary_indices) * n_cols
@@ -1713,6 +1900,43 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
             "evidence": "Matched summary/total header keyword in leading cells.",
             "default_accepted": True
         })
+
+    # 2B. Stacked Sub-Tables (Section Banners & Repeated Embedded Headers)
+    if n_cols > 1:
+        col_names_low = [str(clean_text_hygiene(c)).lower() for c in df_raw.columns if pd.notna(c)]
+        stacked_findings = []
+        for idx in df_raw.index:
+            if idx in summary_idx_set:
+                continue
+            non_null = df_raw.iloc[idx].dropna()
+            if len(non_null) == 0:
+                continue
+            if len(non_null) == 1 and isinstance(non_null.iloc[0], str) and len(non_null.iloc[0].strip()) > 1:
+                banner_txt = clean_text_hygiene(non_null.iloc[0])
+                if banner_txt:
+                    stacked_findings.append((idx, f"Banner: {banner_txt[:30]}", "Tag source_section & Strip Banner"))
+                continue
+            row_strs = [clean_text_hygiene(v).lower() for v in non_null if isinstance(v, str) and clean_text_hygiene(v)]
+            matches = sum(1 for s_val in row_strs if s_val in col_names_low)
+            if len(row_strs) >= 3 and matches >= (len(row_strs) * 0.6):
+                stacked_findings.append((idx, "Repeated Header Row", "Strip Embedded Header"))
+        if stacked_findings:
+            defect_cells += len(stacked_findings) * n_cols
+            proposals.append({
+                "proposal_id": "structure::stacked_tables",
+                "rule_id": "strip_stacked",
+                "rule_name": "Stacked Sub-Tables & Section Banners",
+                "category": "Structure",
+                "column": "All Columns (Table-wide)",
+                "cells_affected": len(stacked_findings),
+                "pct_affected": round(100.0 * len(stacked_findings) / max(n_rows, 1), 1),
+                "examples": [{"row": int(idx) + 1, "before": b_txt, "after": a_txt} for idx, b_txt, a_txt in stacked_findings[:3]],
+                "tier": "AUTO_APPLY",
+                "confidence": 0.95,
+                "confidence_label": "High",
+                "evidence": "Detected single-cell section banners or repeated embedded column header rows.",
+                "default_accepted": True
+            })
 
     # 3. Disguised Missing Sentinels (with Column Context Evidence)
     for col in df_raw.columns:
@@ -1760,6 +1984,7 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                 })
 
     # 4. Excel Date Corruptions & Format Ambiguity
+    date_repaired_cols = set()
     for col in df_raw.columns:
         if col in protected_cols or str(col).endswith(("_flag", "_out_of_range_flag")):
             continue
@@ -1774,6 +1999,7 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
         dt_mask = s.apply(lambda v: isinstance(v, (datetime.datetime, datetime.date, pd.Timestamp)) or bool(re.match(r"^20\d\d-\d{1,2}-\d{1,2}", str(v).strip())))
         count = int(dt_mask.sum())
         if count > 0:
+            date_repaired_cols.add(col)
             is_amb, d_conf, d_tier, d_fmt = evaluate_column_date_evidence(s)
             defect_cells += count if not is_amb else 0
             ex = [{"row": int(idx) + 1, "before": str(s.loc[idx]), "after": fix_excel_date_range(s.loc[idx])} for idx in df_raw.index[dt_mask][:3]]
@@ -1819,6 +2045,7 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                 })
 
     # 6. Near-Duplicate Category Clustering
+    clustered_cols = set()
     for col in df_raw.columns:
         if col in protected_cols:
             continue
@@ -1826,6 +2053,7 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
         if (s.dtype == object or pd.api.types.is_string_dtype(s)) and 2 <= s.nunique() <= 35:
             clusters = cluster_near_duplicate_categories(s)
             if clusters:
+                clustered_cols.add(col)
                 affected = int(s.isin(clusters.keys()).sum())
                 defect_cells += affected
                 ex = [{"row": 0, "before": k, "after": v} for k, v in list(clusters.items())[:3]]
@@ -1846,7 +2074,40 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                     "default_accepted": True
                 })
 
+    # 6B. Excess Whitespace & Line-Break Hygiene
+    for col in df_raw.columns:
+        if col in clustered_cols:
+            continue
+        s = df_raw[col]
+        if s.dtype == object or pd.api.types.is_string_dtype(s):
+            def _needs_trim(v):
+                if not isinstance(v, str):
+                    return False
+                v_m = repair_mojibake_encoding(v)
+                return bool(clean_text_hygiene(v_m) != v_m)
+            trim_mask = s.apply(_needs_trim)
+            count = int(trim_mask.sum())
+            if count > 0:
+                defect_cells += count
+                ex = [{"row": int(idx) + 1, "before": repr(s.loc[idx]), "after": str(clean_text_hygiene(repair_mojibake_encoding(s.loc[idx])))} for idx in df_raw.index[trim_mask][:3]]
+                proposals.append({
+                    "proposal_id": f"trim_strings::{col}",
+                    "rule_id": "trim_strings",
+                    "rule_name": "Whitespace & Line-Break Hygiene",
+                    "category": "Text Hygiene",
+                    "column": str(col),
+                    "cells_affected": count,
+                    "pct_affected": round(100.0 * count / max(n_rows, 1), 1),
+                    "examples": ex,
+                    "tier": "AUTO_APPLY",
+                    "confidence": 0.99,
+                    "confidence_label": "High",
+                    "evidence": "Detected leading/trailing whitespace, embedded newlines, or duplicate internal spaces.",
+                    "default_accepted": True
+                })
+
     # 7. Likert Verbal-to-Numeric Recoding & Unmapped Phrase Discovery
+    likert_repaired_cols = set()
     for col in df_raw.columns:
         if col in protected_cols:
             continue
@@ -1856,6 +2117,7 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
             likert_mask = s_clean.isin(LIKERT_TEXT_MAP.keys())
             count = int(likert_mask.sum())
             if count >= 2 and (count / max(len(s.dropna()), 1)) >= 0.4:
+                likert_repaired_cols.add(col)
                 defect_cells += count
                 ex = []
                 for idx in df_raw.index[likert_mask][:3]:
@@ -1881,6 +2143,49 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
                     "confidence": 0.92,
                     "confidence_label": "High",
                     "evidence": ev_txt,
+                    "default_accepted": True
+                })
+
+    # 7B. Currency, Percentage & European Number Parsing
+    parse_numbers_cols = set()
+    for col in df_raw.columns:
+        if col in protected_cols or col in likert_repaired_cols or col in date_repaired_cols:
+            continue
+        s = df_raw[col]
+        if s.dtype == object or pd.api.types.is_string_dtype(s):
+            non_null = s.dropna()
+            non_sentinel = non_null[~non_null.astype(str).str.strip().str.lower().isin(SENTINEL_VALUES)]
+            if len(non_sentinel) < 2:
+                continue
+            plain_num = pd.to_numeric(non_sentinel, errors="coerce")
+            parsed_num = pd.to_numeric(non_sentinel.apply(parse_numeric_cell), errors="coerce")
+            n_total_valid = int(parsed_num.notna().sum())
+            # Cells that require parse_numeric_cell because plain to_numeric fails (currency, %, Euro comma, parens)
+            fmt_mask = s.apply(
+                lambda v: pd.notna(v)
+                and str(v).strip().lower() not in SENTINEL_VALUES
+                and str(v).strip().lower() not in LIKERT_TEXT_MAP
+                and pd.isna(pd.to_numeric(v, errors="coerce"))
+                and pd.notna(parse_numeric_cell(v))
+            )
+            fmt_count = int(fmt_mask.sum())
+            if fmt_count >= 1 and n_total_valid >= 2 and (n_total_valid / len(non_sentinel)) >= 0.70:
+                parse_numbers_cols.add(col)
+                defect_cells += fmt_count
+                ex = [{"row": int(idx) + 1, "before": str(s.loc[idx]), "after": str(parse_numeric_cell(s.loc[idx]))} for idx in df_raw.index[fmt_mask][:3]]
+                proposals.append({
+                    "proposal_id": f"parse_numbers::{col}",
+                    "rule_id": "parse_numbers",
+                    "rule_name": "Currency, % & Locale Number Parsing",
+                    "category": "Numeric Standardization",
+                    "column": str(col),
+                    "cells_affected": fmt_count,
+                    "pct_affected": round(100.0 * fmt_count / max(n_rows, 1), 1),
+                    "examples": ex,
+                    "tier": "CONFIRM_FIRST",
+                    "confidence": 0.94,
+                    "confidence_label": "High",
+                    "evidence": f"{fmt_count} formatted currency/percentage/decimal strings parsed to numeric ({n_total_valid}/{len(non_sentinel)} valid numeric in column).",
                     "default_accepted": True
                 })
 
@@ -1938,7 +2243,7 @@ def propose_cleaning_repairs(df_raw, rules_config=None, bounds_dict=None, profil
 
     # 9. Multi-Select 'Check all that apply' Splitting
     for col in df_raw.columns:
-        if col in protected_cols and protected_cols[col]["type"] in ["LEADING_ZERO", "PHONE_NUMBER", "ID_COLUMN"]:
+        if col in parse_numbers_cols or (col in protected_cols and protected_cols[col]["type"] in ["LEADING_ZERO", "PHONE_NUMBER", "ID_COLUMN"]):
             continue
         s = df_raw[col]
         if (s.dtype == object or pd.api.types.is_string_dtype(s)) and s.nunique() > 2:
@@ -2038,6 +2343,17 @@ def apply_accepted_repairs(df_raw, accepted_ids, proposals=None, tidy_names=Fals
             rule_changelog.append({"Step": step_num, "Rule_ID": "drop_summaries", "Rule_Name": p["rule_name"], "Column": "(All Columns)", "Cells_Changed": dropped_cnt, "Example_Before": "Summary / Total Row", "Example_After": "Row Removed", "Timestamp": now_str})
             step_num += 1
 
+    # Step 2B: Strip stacked sub-tables & section banners if accepted
+    if "structure::stacked_tables" in accepted_prop_map:
+        p = accepted_prop_map["structure::stacked_tables"]
+        before_rows = len(d)
+        d = detect_and_strip_stacked_tables(d)
+        dropped_stacked = before_rows - len(d)
+        if dropped_stacked > 0 or "source_section" in d.columns:
+            cell_audit.append({"Excel_Row": 2, "Column": "(All Columns)", "Rule_ID": "strip_stacked", "Value_Before": f"{dropped_stacked} Banner/Repeated Header Rows", "Value_After": "Tagged source_section & Stripped"})
+            rule_changelog.append({"Step": step_num, "Rule_ID": "strip_stacked", "Rule_Name": p["rule_name"], "Column": "(All Columns)", "Cells_Changed": max(dropped_stacked, 1), "Example_Before": "Section Banner / Repeated Header", "Example_After": "Stripped & Tagged source_section", "Timestamp": now_str})
+            step_num += 1
+
     # Step 3: Mojibake repair
     for p_id, p in accepted_prop_map.items():
         if p["rule_id"] == "repair_mojibake":
@@ -2054,6 +2370,26 @@ def apply_accepted_repairs(df_raw, accepted_ids, proposals=None, tidy_names=Fals
                             cells_changed += 1
                             cell_audit.append({"Excel_Row": int(idx) + 2, "Column": col, "Rule_ID": p["rule_id"], "Value_Before": str(val), "Value_After": str(repaired)})
                             if ex_b is None: ex_b, ex_a = str(val), str(repaired)
+                if cells_changed > 0:
+                    rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
+                    step_num += 1
+
+    # Step 3B: Whitespace & Line-Break Hygiene
+    for p_id, p in accepted_prop_map.items():
+        if p["rule_id"] == "trim_strings":
+            col = p["column"]
+            if col in d.columns:
+                cells_changed = 0
+                ex_b, ex_a = None, None
+                for idx in d.index:
+                    val = d.loc[idx, col]
+                    if isinstance(val, str):
+                        trimmed = clean_text_hygiene(val)
+                        if trimmed != val:
+                            d.loc[idx, col] = trimmed
+                            cells_changed += 1
+                            cell_audit.append({"Excel_Row": int(idx) + 2, "Column": col, "Rule_ID": p["rule_id"], "Value_Before": repr(val), "Value_After": str(trimmed)})
+                            if ex_b is None: ex_b, ex_a = repr(val), str(trimmed)
                 if cells_changed > 0:
                     rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
                     step_num += 1
@@ -2162,6 +2498,30 @@ def apply_accepted_repairs(df_raw, accepted_ids, proposals=None, tidy_names=Fals
                     except (ValueError, TypeError):
                         pass
                     val_labels[col] = col_val_labels
+                    rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
+                    step_num += 1
+
+    # Step 8B: Currency, Percentage & Locale Number Parsing
+    for p_id, p in accepted_prop_map.items():
+        if p["rule_id"] == "parse_numbers":
+            col = p["column"]
+            if col in d.columns:
+                cells_changed = 0
+                ex_b, ex_a = None, None
+                for idx in d.index:
+                    val = d.loc[idx, col]
+                    if pd.notna(val) and pd.isna(pd.to_numeric(val, errors="coerce")):
+                        parsed_v = parse_numeric_cell(val)
+                        if pd.notna(parsed_v):
+                            d.loc[idx, col] = parsed_v
+                            cells_changed += 1
+                            cell_audit.append({"Excel_Row": int(idx) + 2, "Column": col, "Rule_ID": p["rule_id"], "Value_Before": str(val), "Value_After": str(parsed_v)})
+                            if ex_b is None: ex_b, ex_a = str(val), str(parsed_v)
+                if cells_changed > 0:
+                    try:
+                        d[col] = pd.to_numeric(d[col], errors="raise")
+                    except (ValueError, TypeError):
+                        pass
                     rule_changelog.append({"Step": step_num, "Rule_ID": p["rule_id"], "Rule_Name": p["rule_name"], "Column": col, "Cells_Changed": cells_changed, "Example_Before": ex_b, "Example_After": ex_a, "Timestamp": now_str})
                     step_num += 1
 

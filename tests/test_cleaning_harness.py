@@ -312,3 +312,61 @@ def test_detect_candidate_scale_items_and_statistical_engines():
 
     ols_err = engine.compute_linear_regression(df, "KFL1", ["empty_var"])
     assert ols_err is not None and "empty_var" in ols_err.get("error", "")
+
+
+def test_bucket_a_upgrades():
+    """
+    Verifies Bucket A patches:
+    1. Proposal engine & apply_accepted_repairs support for parse_numbers, strip_stacked, and trim_strings
+    2. Multi-row stacked header auto-detection and merging in apply_import_profile
+    3. Semicolon (;) and Tab (\\t) CSV delimiter sniffing in robust_load_spreadsheet
+    """
+    # 1. Proposal Engine: Currency/Euro numbers, Stacked Banners, and Whitespace Hygiene
+    df_messy = pd.DataFrame({
+        "Dept": ["  Engineering  ", "Marketing", "Cohort B", "Sales", "Finance"],
+        "Budget": ["$1,200.50", "1.500,00 kr", None, "($250.00)", "800"],
+        "Completion": ["85%", "90%", None, "75.5%", "100%"]
+    })
+    prop_res = engine.propose_cleaning_repairs(df_messy)
+    rule_ids = {p["rule_id"] for p in prop_res["proposals"]}
+    assert "strip_stacked" in rule_ids
+    assert "parse_numbers" in rule_ids
+    assert "trim_strings" in rule_ids
+
+    acc_ids = [p["proposal_id"] for p in prop_res["proposals"] if p.get("default_accepted")]
+    app_res = engine.apply_accepted_repairs(df_messy, acc_ids, proposals=prop_res["proposals"])
+    df_c = app_res["df_cleaned"]
+
+    assert len(df_c) == 4  # 'Cohort B' banner row stripped
+    assert "source_section" in df_c.columns
+    assert list(df_c["source_section"]) == ["Main", "Main", "Cohort B", "Cohort B"]
+    assert df_c.loc[0, "Dept"] == "Engineering"  # Trimmed
+    assert df_c.loc[0, "Budget"] == pytest.approx(1200.50)
+    assert df_c.loc[1, "Budget"] == pytest.approx(1500.00)
+    assert df_c.loc[2, "Budget"] == pytest.approx(-250.00)
+
+    # 2. Multi-Row Stacked Header Auto-Detection in Generic Import Profile
+    raw_multi = pd.DataFrame([
+        ["ID", "Demographics", "Demographics", "Financials", "Financials"],
+        ["ID", "Age", "Gender", "Revenue", "Cost"],
+        ["R1", 29, "Female", 5000, 3200],
+        ["R2", 41, "Male", 6200, 4100],
+    ])
+    imp_multi = engine.apply_import_profile(raw_multi, profile="generic")
+    assert imp_multi["headers_stripped"] == 2
+    assert list(imp_multi["df"].columns) == [
+        "ID", "Demographics - Age", "Demographics - Gender", "Financials - Revenue", "Financials - Cost"
+    ]
+    assert len(imp_multi["df"]) == 2
+
+    # 3. Semicolon and Tab CSV Delimiter Sniffing
+    semi_csv = b"ID;Department;Score\n1;Engineering;95\n2;Marketing;88\n"
+    df_semi, meta_semi = engine.robust_load_spreadsheet(semi_csv, "european_export.csv")
+    assert meta_semi["delimiter_used"] == ";"
+    assert df_semi.shape == (3, 3)
+
+    tab_csv = b"ID\tDepartment\tScore\n1\tEngineering\t95\n2\tMarketing\t88\n"
+    df_tab, meta_tab = engine.robust_load_spreadsheet(tab_csv, "tab_export.csv")
+    assert meta_tab["delimiter_used"] == "\t"
+    assert df_tab.shape == (3, 3)
+

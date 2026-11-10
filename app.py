@@ -769,11 +769,18 @@ elif app_mode.startswith("🔍"):
 
     chosen_sheet = None
     load_meta = {"hidden_sheets": [], "unmerged_cells_count": 0}
-    if not uploaded_general.name.endswith(".csv"):
+    if not uploaded_general.name.lower().endswith((".csv", ".tsv", ".txt")):
         try:
-            import openpyxl
-            wb_peek = openpyxl.load_workbook(uploaded_general, read_only=True)
-            sheet_names = wb_peek.sheetnames
+            if hasattr(uploaded_general, "seek"):
+                uploaded_general.seek(0)
+            if uploaded_general.name.lower().endswith(".xls"):
+                import xlrd
+                wb_peek = xlrd.open_workbook(file_contents=uploaded_general.read())
+                sheet_names = wb_peek.sheet_names()
+            else:
+                import openpyxl
+                wb_peek = openpyxl.load_workbook(uploaded_general, read_only=True)
+                sheet_names = wb_peek.sheetnames
             if len(sheet_names) > 1:
                 st.sidebar.subheader("Multi-Sheet Options")
                 sheet_mode = st.sidebar.radio(
@@ -935,9 +942,15 @@ elif app_mode.startswith("🔍"):
 
     # Session state synchronization with active cleaning state
     active_key = f"active_df_{uploaded_general.name}"
-    if active_key not in st.session_state or st.session_state.get("current_file") != uploaded_general.name:
+    opts_key = f"cleaning_opts_{uploaded_general.name}"
+    if (
+        active_key not in st.session_state
+        or st.session_state.get("current_file") != uploaded_general.name
+        or st.session_state.get(opts_key) != cleaning_options
+    ):
         st.session_state[active_key] = df_base_cleaned.copy()
         st.session_state["current_file"] = uploaded_general.name
+        st.session_state[opts_key] = dict(cleaning_options)
 
     df_cleaned = st.session_state[active_key]
 
